@@ -1,0 +1,28 @@
+# Env & secrets
+.env
+gee-service-account.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Node / Hardhat
+node_modules/
+contracts/artifacts/
+contracts/cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
