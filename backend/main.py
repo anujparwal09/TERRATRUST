@@ -6,6 +6,7 @@ health check, and GEE initialization on startup.
 """
 
 import os
+import json
 import logging
 
 from fastapi import FastAPI
@@ -88,18 +89,33 @@ async def startup_event():
     try:
         import ee
 
-        gee_key_path = settings.GEE_SERVICE_ACCOUNT_KEY_PATH
-        gee_email = settings.GEE_SERVICE_ACCOUNT_EMAIL
+        # Try JSON env variable first (for cloud deployment on Render)
+        gee_json = os.getenv("GEE_SERVICE_ACCOUNT_JSON")
 
-        if gee_key_path and os.path.exists(gee_key_path):
-            credentials = ee.ServiceAccountCredentials(gee_email, gee_key_path)
-            ee.Initialize(credentials)
-            logger.info("Google Earth Engine initialised with service account.")
-        else:
-            logger.warning(
-                "GEE service-account key file not found at '%s'. "
-                "GEE-dependent features will be unavailable.",
-                gee_key_path,
+        if gee_json:
+            key_data = json.loads(gee_json)
+            credentials = ee.ServiceAccountCredentials(
+                email=key_data["client_email"],
+                key_data=json.dumps(key_data),
             )
+            ee.Initialize(credentials)
+            logger.info("Google Earth Engine initialised from GEE_SERVICE_ACCOUNT_JSON env variable.")
+
+        # Fall back to key file path (for local development)
+        else:
+            gee_key_path = settings.GEE_SERVICE_ACCOUNT_KEY_PATH
+            gee_email = settings.GEE_SERVICE_ACCOUNT_EMAIL
+
+            if gee_key_path and os.path.exists(gee_key_path):
+                credentials = ee.ServiceAccountCredentials(gee_email, gee_key_path)
+                ee.Initialize(credentials)
+                logger.info("Google Earth Engine initialised from key file: %s", gee_key_path)
+            else:
+                logger.warning(
+                    "GEE_SERVICE_ACCOUNT_JSON env variable not set and key file not found at '%s'. "
+                    "GEE-dependent features will be unavailable.",
+                    gee_key_path,
+                )
+
     except Exception as exc:
         logger.error("Failed to initialise Google Earth Engine: %s", exc)
