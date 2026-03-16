@@ -1,6 +1,5 @@
 # Env & secrets
 .env
-gee-service-account.json
 
 # Python
 __pycache__/
