@@ -4,7 +4,7 @@ TerraTrust-AR Backend — main application entry point.
 FastAPI application with CORS middleware, router includes,
 health check, and GEE initialization on startup.
 """
-
+ 
 import os
 import json
 import logging
