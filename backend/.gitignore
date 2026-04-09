@@ -1,6 +1,7 @@
 # Env & secrets
 .env
 gee-service-account.json
+firebase-service-account.json
 
 # Python
 __pycache__/
@@ -11,6 +12,7 @@ venv/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
 
 # Node / Hardhat
 node_modules/

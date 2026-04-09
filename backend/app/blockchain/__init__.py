@@ -1,1 +1,0 @@
-# TerraTrust-AR blockchain package

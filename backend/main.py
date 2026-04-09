@@ -1,23 +1,19 @@
-"""
-TerraTrust-AR Backend — main application entry point.
+"""TerraTrust-AR FastAPI application entry point."""
 
-FastAPI application with CORS middleware, router includes,
-health check, and GEE initialization on startup.
-"""
- 
-import os
-import json
 import logging
+from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from app.config import settings
+from app.firebase_auth import get_firebase_app
+from app.gee import ensure_gee_initialized
 from routers import auth, land, audit, credits
-from app.api import upload
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -28,13 +24,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger("terratrust")
 
+ALLOWED_CORS_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+ALLOWED_CORS_HEADERS = [
+    "Authorization",
+    "Content-Type",
+    "Accept",
+    "Origin",
+    "X-Requested-With",
+]
+
+
+def _get_cors_origins() -> list[str]:
+    """Return explicit CORS origins compatible with credentialed requests."""
+    configured_origins = [
+        origin.strip()
+        for origin in (settings.WEB_CORS_ORIGINS or "").split(",")
+        if origin.strip()
+    ]
+
+    if configured_origins:
+        return configured_origins
+
+    if settings.ENVIRONMENT == "development":
+        return [
+            "http://localhost:8081",
+            "http://127.0.0.1:8081",
+            "http://localhost:19006",
+            "http://127.0.0.1:19006",
+        ]
+
+    return []
+
 # ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="TerraTrust-AR API",
     description="Autonomous carbon credit verification for Indian smallholder farmers.",
-    version="1.0.0",
+    version="3.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -42,14 +69,12 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 # CORS middleware
 # ---------------------------------------------------------------------------
-cors_origins = ["*"] if settings.ENVIRONMENT == "development" else [settings.CORS_ORIGIN]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=_get_cors_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=ALLOWED_CORS_METHODS,
+    allow_headers=ALLOWED_CORS_HEADERS,
 )
 
 # ---------------------------------------------------------------------------
@@ -59,16 +84,29 @@ app.include_router(auth.router, prefix="/api/v1/auth", tags=["Auth"])
 app.include_router(land.router, prefix="/api/v1/land", tags=["Land"])
 app.include_router(audit.router, prefix="/api/v1/audit", tags=["Audit"])
 app.include_router(credits.router, prefix="/api/v1/credits", tags=["Credits"])
-app.include_router(upload.router, prefix="/api/v1/document", tags=["Blockchain"])
 
 
-# ---------------------------------------------------------------------------
-# Root endpoint
-# ---------------------------------------------------------------------------
-@app.get("/", tags=["Health"])
-def root():
-    """Root endpoint — confirms the backend is running."""
-    return {"message": "TerraTrust backend running"}
+@app.middleware("http")
+async def maintenance_mode_middleware(request: Request, call_next):
+    """Return the documented 503 payload when maintenance mode is active."""
+    exempt_paths = {
+        "/health",
+        "/api/v1/status",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+    }
+
+    if settings.MAINTENANCE_MODE and request.url.path not in exempt_paths:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "maintenance": True,
+                "message": settings.MAINTENANCE_MESSAGE or "Scheduled maintenance in progress",
+            },
+        )
+
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -77,45 +115,35 @@ def root():
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Return basic service health status."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/v1/status", tags=["Health"])
+async def application_status():
+    """Return the documented farmer-facing maintenance status payload."""
+    maintenance = bool(settings.MAINTENANCE_MODE)
+    return {
+        "maintenance": maintenance,
+        "message": settings.MAINTENANCE_MESSAGE if maintenance else None,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Startup event — initialise Google Earth Engine
+# Startup event — initialise external SDKs
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    """Initialise Google Earth Engine with service account on startup."""
+    """Initialise Firebase Admin and Google Earth Engine on startup."""
     try:
-        import ee
+        get_firebase_app()
+        logger.info("Firebase Admin initialised.")
+    except Exception as exc:
+        logger.warning("Failed to initialise Firebase Admin: %s", exc)
 
-        # Try JSON env variable first (for cloud deployment on Render)
-        gee_json = os.getenv("GEE_SERVICE_ACCOUNT_JSON")
-
-        if gee_json:
-            key_data = json.loads(gee_json)
-            credentials = ee.ServiceAccountCredentials(
-                email=key_data["client_email"],
-                key_data=json.dumps(key_data),
-            )
-            ee.Initialize(credentials)
-            logger.info("Google Earth Engine initialised from GEE_SERVICE_ACCOUNT_JSON env variable.")
-
-        # Fall back to key file path (for local development)
-        else:
-            gee_key_path = settings.GEE_SERVICE_ACCOUNT_KEY_PATH
-            gee_email = settings.GEE_SERVICE_ACCOUNT_EMAIL
-
-            if gee_key_path and os.path.exists(gee_key_path):
-                credentials = ee.ServiceAccountCredentials(gee_email, gee_key_path)
-                ee.Initialize(credentials)
-                logger.info("Google Earth Engine initialised from key file: %s", gee_key_path)
-            else:
-                logger.warning(
-                    "GEE_SERVICE_ACCOUNT_JSON env variable not set and key file not found at '%s'. "
-                    "GEE-dependent features will be unavailable.",
-                    gee_key_path,
-                )
-
+    try:
+        ensure_gee_initialized()
     except Exception as exc:
         logger.error("Failed to initialise Google Earth Engine: %s", exc)

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.29;
 
 import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
- * @title  TerraToken
+ * @title  TerraTrustToken
  * @notice ERC-1155 contract for TerraTrust-AR carbon credits.
  *
  *         Token ID 1       = Fungible carbon credits (CTT).
@@ -13,31 +13,22 @@ import "@openzeppelin/contracts/access/Ownable.sol";
  *
  *         Double-mint prevention uses keccak256(landId, auditYear).
  */
-contract TerraToken is ERC1155, Ownable {
-    // ---------------------------------------------------------------
-    // Constants
-    // ---------------------------------------------------------------
+contract TerraTrustToken is ERC1155, Ownable {
     uint256 public constant CARBON_CREDIT = 1;
 
-    // ---------------------------------------------------------------
-    // State
-    // ---------------------------------------------------------------
-
-    /// @notice IPFS evidence hash for each audit certificate tokenId
+    /// @notice IPFS evidence URI for each audit certificate tokenId.
     mapping(uint256 => string) public auditEvidence;
 
-    /// @notice Tracks whether a (landId, auditYear) combo has been minted
+    /// @notice Tracks whether a (landId, auditYear) combo has been minted.
     mapping(bytes32 => bool) public auditMinted;
 
-    /// @notice Retired (burned) credit balance per address
+    /// @notice Retired (burned) credit balance per address.
     mapping(address => uint256) public retiredCredits;
 
-    // ---------------------------------------------------------------
-    // Events
-    // ---------------------------------------------------------------
     event CreditRetired(
-        address indexed account,
+        address indexed retiredBy,
         uint256 amount,
+        string retirementReason,
         uint256 timestamp
     );
 
@@ -49,27 +40,24 @@ contract TerraToken is ERC1155, Ownable {
         uint256 timestamp
     );
 
-    // ---------------------------------------------------------------
-    // Constructor
-    // ---------------------------------------------------------------
-    constructor()
-        ERC1155("ipfs://terratrust/{id}.json")
-        Ownable(msg.sender)
-    {}
-
-    // ---------------------------------------------------------------
-    // Mint
-    // ---------------------------------------------------------------
+    constructor() ERC1155("") Ownable(msg.sender) {}
 
     /**
-     * @notice Mint fungible carbon credits **and** a unique audit
-     *         certificate NFT.
-     * @param  farmer       Recipient wallet.
-     * @param  auditId      Numeric audit ID (used as NFT token id).
-     * @param  creditAmount Number of fungible CTT tokens to mint.
-     * @param  landId       String land parcel UUID (for double-mint).
-     * @param  auditYear    Calendar year of the audit.
-     * @param  ipfsHash     IPFS URI of the evidence metadata.
+     * @notice Documented parameter order from the v3.1 backend spec.
+     */
+    function mintAudit(
+        address farmer,
+        uint256 auditId,
+        uint256 creditAmount,
+        string calldata ipfsHash,
+        string calldata landId,
+        uint256 auditYear
+    ) external onlyOwner {
+        _mintAuditRecord(farmer, auditId, creditAmount, ipfsHash, landId, auditYear);
+    }
+
+    /**
+     * @notice Legacy parameter order retained for backward compatibility.
      */
     function mintAudit(
         address farmer,
@@ -79,46 +67,47 @@ contract TerraToken is ERC1155, Ownable {
         uint256 auditYear,
         string calldata ipfsHash
     ) external onlyOwner {
-        // --- Double-mint prevention ------------------------------------
+        _mintAuditRecord(farmer, auditId, creditAmount, ipfsHash, landId, auditYear);
+    }
+
+    function _mintAuditRecord(
+        address farmer,
+        uint256 auditId,
+        uint256 creditAmount,
+        string calldata ipfsHash,
+        string calldata landId,
+        uint256 auditYear
+    ) internal {
         bytes32 auditKey = keccak256(abi.encodePacked(landId, auditYear));
-        require(!auditMinted[auditKey], "Audit already minted for this land and year");
+        require(!auditMinted[auditKey], "Credits already minted for this land this year");
         auditMinted[auditKey] = true;
 
-        // --- Mint fungible credits (token id 1) ------------------------
         _mint(farmer, CARBON_CREDIT, creditAmount, "");
-
-        // --- Mint NFT certificate (token id = auditId) -----------------
         _mint(farmer, auditId, 1, "");
 
-        // --- Store IPFS evidence ---------------------------------------
         auditEvidence[auditId] = ipfsHash;
 
         emit AuditMinted(farmer, auditId, creditAmount, ipfsHash, block.timestamp);
     }
 
-    // ---------------------------------------------------------------
-    // Retire (burn)
-    // ---------------------------------------------------------------
-
     /**
      * @notice Permanently retire (burn) carbon credits.
-     * @param  amount Number of CTT tokens to retire.
      */
-    function retireCredits(uint256 amount) external {
+    function retireCredits(uint256 amount, string memory reason) public {
         require(
             balanceOf(msg.sender, CARBON_CREDIT) >= amount,
-            "Insufficient credit balance"
+            "Insufficient credits to retire"
         );
 
         _burn(msg.sender, CARBON_CREDIT, amount);
         retiredCredits[msg.sender] += amount;
 
-        emit CreditRetired(msg.sender, amount, block.timestamp);
+        emit CreditRetired(msg.sender, amount, reason, block.timestamp);
     }
 
-    // ---------------------------------------------------------------
-    // View helpers
-    // ---------------------------------------------------------------
+    function retireCredits(uint256 amount) external {
+        retireCredits(amount, "");
+    }
 
     /**
      * @notice Return the IPFS evidence URI for an audit certificate.
@@ -127,3 +116,5 @@ contract TerraToken is ERC1155, Ownable {
         return auditEvidence[auditId];
     }
 }
+
+contract TerraToken is TerraTrustToken {}

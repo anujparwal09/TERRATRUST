@@ -1,32 +1,41 @@
-"""
-Land router — document verification, boundary fetch, and registration.
+"""Land verification router aligned to the backend design document."""
 
-POST /api/v1/land/verify-document
-GET  /api/v1/land/fetch-boundary
-POST /api/v1/land/register
-"""
-
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
 import logging
+from pathlib import Path
 import unicodedata
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from shapely.geometry import shape
 
-from app.database import supabase_client
+from app.database import (
+    analyse_boundary_geojson,
+    insert_land_parcel_record,
+    list_land_parcels_for_user,
+    supabase_client,
+)
 from app.dependencies import get_current_user
 from models.land import (
     BoundaryFetchResponse,
     DocumentUploadResponse,
+    LandListItem,
+    LandListResponse,
     LandRegisterRequest,
     LandRegisterResponse,
+    LandUpdateRequest,
+    LandUpdateResponse,
 )
-from services import land_boundary_service, ocr_service
+from services import land_boundary_service, ocr_service, satellite_service
 
 logger = logging.getLogger("terratrust.land")
 
 router = APIRouter()
+
+MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
+ALLOWED_DOCUMENT_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png"}
+ALLOWED_DOCUMENT_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +48,38 @@ def _normalise_name(name: str) -> str:
     return " ".join(ascii_only.lower().split())
 
 
+def _name_similarity(left: str, right: str) -> float:
+    """Return a fuzzy similarity ratio for owner-name matching."""
+    return SequenceMatcher(None, _normalise_name(left), _normalise_name(right)).ratio()
+
+
+def _validate_document_upload(file: UploadFile, image_bytes: bytes) -> None:
+    """Validate documented land-record image constraints before OCR."""
+    content_type = (file.content_type or "").lower()
+    extension = Path(file.filename or "").suffix.lower()
+
+    if (
+        content_type not in ALLOWED_DOCUMENT_CONTENT_TYPES
+        and extension not in ALLOWED_DOCUMENT_EXTENSIONS
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Only JPG and PNG land-document images are supported.",
+        )
+
+    if not image_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded land document is empty.",
+        )
+
+    if len(image_bytes) > MAX_DOCUMENT_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Land document image must be 10 MB or smaller.",
+        )
+
+
 # ---------------------------------------------------------------------------
 # POST /verify-document
 # ---------------------------------------------------------------------------
@@ -48,12 +89,19 @@ def _normalise_name(name: str) -> str:
     status_code=status.HTTP_200_OK,
 )
 async def verify_document(
-    file: UploadFile = File(..., description="Scanned land document image"),
-    _user_id: str = Depends(get_current_user),
+    image: UploadFile | None = File(None, description="Scanned land document image"),
+    _current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Extract structured fields from a scanned land document using OCR."""
+    if image is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Multipart field 'image' is required.",
+        )
+
     try:
-        image_bytes = await file.read()
+        image_bytes = await image.read()
+        _validate_document_upload(image, image_bytes)
         fields = ocr_service.extract_fields_from_document(image_bytes)
         return DocumentUploadResponse(
             survey_number=fields["survey_number"],
@@ -61,6 +109,7 @@ async def verify_document(
             village=fields.get("village"),
             taluka=fields.get("taluka"),
             district=fields.get("district"),
+            state=fields.get("state", "Maharashtra"),
             extraction_confidence=fields["extraction_confidence"],
         )
     except ValueError as exc:
@@ -88,7 +137,7 @@ async def fetch_boundary(
     state: str = Query(...),
     user_lat: float = Query(...),
     user_lng: float = Query(...),
-    _user_id: str = Depends(get_current_user),
+    _current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Attempt to auto-fetch the land boundary from government GIS layers."""
     result = await land_boundary_service.fetch_land_boundary(
@@ -113,29 +162,19 @@ async def fetch_boundary(
 )
 async def register_land(
     body: LandRegisterRequest,
-    user_id: str = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Register a verified land parcel.
 
     Validations
     -----------
     1. OCR owner name must match KYC name (normalised comparison).
-    2. GeoJSON must produce a valid Shapely polygon.
+    2. GeoJSON must be valid polygonal geometry in PostGIS.
     3. No duplicate (same user + survey_number).
     """
 
     # --- 1. Cross-check owner name with KYC name --------------------------
-    try:
-        user_resp = (
-            supabase_client.table("users")
-            .select("full_name")
-            .eq("id", user_id)
-            .single()
-            .execute()
-        )
-        kyc_name = user_resp.data.get("full_name", "")
-    except Exception:
-        kyc_name = ""
+    kyc_name = current_user.get("full_name") or ""
 
     if not kyc_name:
         raise HTTPException(
@@ -143,31 +182,42 @@ async def register_land(
             detail="KYC must be completed before registering land.",
         )
 
-    if _normalise_name(body.ocr_owner_name) != _normalise_name(kyc_name):
+    similarity = _name_similarity(body.ocr_owner_name, kyc_name)
+    if similarity < 0.80:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"Document owner name '{body.ocr_owner_name}' does not "
-                f"match your KYC name '{kyc_name}'."
+                "Owner name on document does not match your registered name."
             ),
         )
 
-    # --- 2. Validate GeoJSON with Shapely ----------------------------------
+    # --- 2. Validate GeoJSON in PostGIS ------------------------------------
     try:
-        geom = shape(body.geojson)
-        if not geom.is_valid:
-            raise ValueError("Invalid geometry")
+        boundary_analysis = await analyse_boundary_geojson(body.geojson)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid GeoJSON geometry: {exc}",
         ) from exc
 
+    if not boundary_analysis.get("is_valid"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid GeoJSON geometry.",
+        )
+
+    geometry_type = boundary_analysis.get("geometry_type")
+    if geometry_type not in {"ST_Polygon", "ST_MultiPolygon"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Land boundary must be a Polygon or MultiPolygon geometry.",
+        )
+
     # --- 3. Duplicate check ------------------------------------------------
     dup_check = (
         supabase_client.table("land_parcels")
         .select("id")
-        .eq("user_id", user_id)
+        .eq("user_id", current_user["id"])
         .eq("survey_number", body.survey_number)
         .execute()
     )
@@ -177,17 +227,19 @@ async def register_land(
             detail="This survey number is already registered under your account.",
         )
 
-    # --- 4. Calculate area in hectares -------------------------------------
-    # Approximate conversion for small areas in decimal-degree geometry
-    # 1° lat ≈ 111 320 m, area in sq-degrees → sq-metres → hectares
-    area_sq_deg = geom.area
-    area_hectares = round(area_sq_deg * 111320 * 111320 / 10000, 4)
+    # --- 4. Validate area in hectares --------------------------------------
+    area_hectares = round(float(boundary_analysis.get("area_hectares") or 0), 4)
+    if area_hectares < 0.1 or area_hectares > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Land area must be between 0.1 and 100 hectares.",
+        )
 
     # --- 5. Insert into Supabase -------------------------------------------
     land_id = str(uuid.uuid4())
     insert_data: Dict[str, Any] = {
         "id": land_id,
-        "user_id": user_id,
+        "user_id": current_user["id"],
         "farm_name": body.farm_name,
         "survey_number": body.survey_number,
         "district": body.district,
@@ -195,13 +247,15 @@ async def register_land(
         "village": body.village,
         "state": body.state,
         "boundary_source": body.boundary_source,
-        "geojson": body.geojson,
+        "ocr_owner_name": body.ocr_owner_name,
+        "boundary_geojson": boundary_analysis.get("normalized_geojson") or body.geojson,
         "area_hectares": area_hectares,
-        "status": "verified",
+        "is_verified": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
     try:
-        supabase_client.table("land_parcels").insert(insert_data).execute()
+        insert_result = await insert_land_parcel_record(insert_data)
     except Exception as exc:
         logger.error("Failed to insert land parcel: %s", exc)
         raise HTTPException(
@@ -209,9 +263,131 @@ async def register_land(
             detail="Failed to register land parcel.",
         ) from exc
 
-    logger.info("Land parcel %s registered for user %s", land_id, user_id)
+    logger.info("Land parcel %s registered for user %s", land_id, current_user["id"])
     return LandRegisterResponse(
         land_id=land_id,
-        area_hectares=area_hectares,
+        area_hectares=insert_result.get("area_hectares") or area_hectares,
         status="verified",
     )
+
+
+@router.get("/list", response_model=LandListResponse, status_code=status.HTTP_200_OK)
+async def list_lands(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Return all registered land parcels for the authenticated farmer."""
+    try:
+        parcels = await list_land_parcels_for_user(current_user["id"])
+        total = len(parcels)
+        start_index = (page - 1) * limit
+        page_items = parcels[start_index : start_index + limit]
+        current_year = datetime.now(timezone.utc).year
+
+        items: List[LandListItem] = []
+        for parcel in page_items:
+            audits_response = (
+                supabase_client.table("carbon_audits")
+                .select("id, status, audit_year, created_at")
+                .eq("land_id", parcel["id"])
+                .order("audit_year", desc=True)
+                .execute()
+            )
+            audit_rows = audits_response.data or []
+            last_audit_year = next(
+                (
+                    audit["audit_year"]
+                    for audit in audit_rows
+                    if audit.get("status") in {"MINTED", "COMPLETE_NO_CREDITS"}
+                ),
+                None,
+            )
+            current_audit = next(
+                (audit for audit in audit_rows if audit.get("audit_year") == current_year),
+                None,
+            )
+
+            thumbnail_url = None
+            try:
+                boundary_geojson = parcel.get("boundary_geojson") or parcel.get("geojson")
+                if boundary_geojson:
+                    thumbnail_url = satellite_service.generate_true_color_thumbnail_url(
+                        boundary_geojson,
+                        dimensions=512,
+                    )
+            except Exception as exc:
+                logger.warning("Failed to generate thumbnail for land %s: %s", parcel["id"], exc)
+
+            items.append(
+                LandListItem(
+                    id=parcel["id"],
+                    farm_name=parcel.get("farm_name") or "Unnamed Field",
+                    survey_number=parcel["survey_number"],
+                    area_hectares=parcel.get("area_hectares") or 0.0,
+                    is_verified=bool(parcel.get("is_verified", True)),
+                    last_audit_year=last_audit_year,
+                    current_audit_id=current_audit.get("id") if current_audit else None,
+                    current_audit_status=current_audit.get("status") if current_audit else None,
+                    thumbnail_url=thumbnail_url,
+                )
+            )
+
+        return LandListResponse(
+            items=items,
+            page=page,
+            limit=limit,
+            total=total,
+            has_more=start_index + limit < total,
+        )
+    except Exception as exc:
+        logger.error("Failed to list lands for user %s: %s", current_user["id"], exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch registered lands.",
+        ) from exc
+
+
+@router.patch("/{land_id}", response_model=LandUpdateResponse, status_code=status.HTTP_200_OK)
+async def update_land_name(
+    land_id: str,
+    body: LandUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Update the farmer-facing name of a registered land parcel."""
+    farm_name = " ".join(body.farm_name.split())
+    if not farm_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Farm name cannot be empty.",
+        )
+
+    try:
+        land_response = (
+            supabase_client.table("land_parcels")
+            .select("id, user_id")
+            .eq("id", land_id)
+            .single()
+            .execute()
+        )
+        land_data = land_response.data
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Land parcel not found",
+        ) from exc
+
+    if land_data.get("user_id") != current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not own this land parcel.",
+        )
+
+    supabase_client.table("land_parcels").update(
+        {
+            "farm_name": farm_name,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ).eq("id", land_id).execute()
+
+    return LandUpdateResponse(land_id=land_id, farm_name=farm_name)

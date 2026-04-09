@@ -1,1 +1,0 @@
-# TerraTrust-AR utils package

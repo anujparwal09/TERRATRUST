@@ -15,13 +15,21 @@ multi-band feature stack for biomass modelling.
 """
 
 import logging
-import os
 from datetime import datetime, timedelta
+import hashlib
+import json
 from typing import Any, Dict, Optional, Tuple
+
 import ee
-from app.config import settings
+import httpx
+
+from app.database import supabase_client
+from app.gee import ensure_gee_initialized
 
 logger = logging.getLogger("terratrust.satellite")
+
+THUMBNAIL_BUCKET = "land-documents"
+THUMBNAIL_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -29,28 +37,8 @@ logger = logging.getLogger("terratrust.satellite")
 # ---------------------------------------------------------------------------
 def _ensure_gee() -> None:
     """Initialise Google Earth Engine if not already done (idempotent).
-
-    Uses the service account credentials from application settings.
-
-    Raises
-    ------
-    RuntimeError
-        If the GEE key file is not found.
     """
-    try:
-        ee.Number(1).getInfo()
-    except Exception:
-        key_path = settings.GEE_SERVICE_ACCOUNT_KEY_PATH
-        email = settings.GEE_SERVICE_ACCOUNT_EMAIL
-        if key_path and os.path.exists(key_path):
-            credentials = ee.ServiceAccountCredentials(email, key_path)
-            ee.Initialize(credentials)
-            logger.info("Google Earth Engine initialised.")
-        else:
-            raise RuntimeError(
-                f"GEE service-account key not found at '{key_path}'. "
-                "Cannot fetch satellite data."
-            )
+    ensure_gee_initialized()
 
 
 def _build_ee_region(boundary_geojson: Dict[str, Any]) -> ee.Geometry:
@@ -303,8 +291,8 @@ def build_feature_stack(
     Returns
     -------
     ee.Image
-        8-band image: ``VH, VV, NDVI, EVI, RED_EDGE, GEDI_RH98,
-        ELEVATION, SLOPE``, clipped to the parcel boundary.
+        9-band image: ``S1_VH, S1_VV, S1_VH_VV_RATIO, NDVI, EVI,
+        RED_EDGE, GEDI_RH98, ELEVATION, SLOPE``, clipped to the parcel boundary.
     """
     _ensure_gee()
 
@@ -313,6 +301,9 @@ def build_feature_stack(
 
     # Fetch individual layers
     s1 = fetch_sentinel1(region, date_start, date_end, speckle_filter)
+    s1_vh = s1.select("VH").rename("S1_VH")
+    s1_vv = s1.select("VV").rename("S1_VV")
+    s1_ratio = s1_vh.divide(s1_vv).rename("S1_VH_VV_RATIO")
     s2 = fetch_sentinel2(region, date_start, date_end, max_cloud_pct)
     ndvi, evi, red_edge = compute_vegetation_indices(s2)
     gedi = fetch_gedi_canopy(region)
@@ -320,14 +311,80 @@ def build_feature_stack(
 
     # Stack all bands
     feature_stack = ee.Image.cat(
-        [s1, ndvi, evi, red_edge, gedi, elevation, slope]
+        [s1_vh, s1_vv, s1_ratio, ndvi, evi, red_edge, gedi, elevation, slope]
     ).clip(region)
 
     logger.info(
-        "Built 8-band feature stack: VH, VV, NDVI, EVI, "
-        "RED_EDGE, GEDI_RH98, ELEVATION, SLOPE."
+        "Built 9-band feature stack: S1_VH, S1_VV, S1_VH_VV_RATIO, NDVI, "
+        "EVI, RED_EDGE, GEDI_RH98, ELEVATION, SLOPE."
     )
     return feature_stack
+
+
+def generate_true_color_thumbnail_url(
+    boundary_geojson: Dict[str, Any],
+    dimensions: int = 1024,
+    max_cloud_pct: int = 20,
+) -> str:
+    """Return a signed Supabase URL for a Sentinel-2 true-colour PNG when possible."""
+    _ensure_gee()
+
+    region = _build_ee_region(boundary_geojson)
+    date_start, date_end = _default_date_range(365)
+    rgb = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(region)
+        .filterDate(date_start, date_end)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", max_cloud_pct))
+        .median()
+        .select(["B4", "B3", "B2"])
+        .clip(region)
+    )
+
+    raw_thumbnail_url = rgb.getThumbURL(
+        {
+            "region": region,
+            "dimensions": dimensions,
+            "format": "png",
+            "min": 0,
+            "max": 3000,
+        }
+    )
+
+    thumbnail_key = hashlib.sha256(
+        json.dumps(boundary_geojson, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    object_path = f"thumbnails/{thumbnail_key}-{dimensions}.png"
+
+    try:
+        response = httpx.get(raw_thumbnail_url, timeout=60.0)
+        response.raise_for_status()
+
+        try:
+            supabase_client.storage.from_(THUMBNAIL_BUCKET).upload(
+                object_path,
+                response.content,
+            )
+        except Exception as exc:
+            if "exists" not in str(exc).lower() and "duplicate" not in str(exc).lower():
+                raise
+
+        signed_response = supabase_client.storage.from_(THUMBNAIL_BUCKET).create_signed_url(
+            object_path,
+            THUMBNAIL_TTL_SECONDS,
+        )
+        if isinstance(signed_response, dict):
+            signed_url = (
+                signed_response.get("signedURL")
+                or signed_response.get("signedUrl")
+                or signed_response.get("signed_url")
+            )
+            if signed_url:
+                return signed_url
+    except Exception as exc:
+        logger.warning("Falling back to raw GEE thumbnail URL: %s", exc)
+
+    return raw_thumbnail_url
 
 
 # ---------------------------------------------------------------------------
@@ -352,9 +409,7 @@ def get_satellite_stats(
     Returns
     -------
     dict
-        Mean values: ``{s1_vh_mean, s1_vv_mean, ndvi_mean,
-        evi_mean, red_edge_mean, gedi_height_mean,
-        elevation_mean, slope_mean}``
+        Mean values aligned to the documented audit metadata fields.
     """
     _ensure_gee()
 
@@ -372,23 +427,24 @@ def get_satellite_stats(
     )
 
     result = {
-        "s1_vh_mean": stats.get("VH", 0),
-        "s1_vv_mean": stats.get("VV", 0),
-        "ndvi_mean": stats.get("NDVI", 0),
-        "evi_mean": stats.get("EVI", 0),
-        "red_edge_mean": stats.get("RED_EDGE", 0),
+        "s1_vh_mean_db": stats.get("S1_VH", 0),
+        "s1_vv_mean_db": stats.get("S1_VV", 0),
+        "s1_vh_vv_ratio_mean": stats.get("S1_VH_VV_RATIO", 0),
+        "s2_ndvi_mean": stats.get("NDVI", 0),
+        "s2_evi_mean": stats.get("EVI", 0),
+        "s2_red_edge_mean": stats.get("RED_EDGE", 0),
         "gedi_height_mean": stats.get("GEDI_RH98", 0),
-        "elevation_mean": stats.get("ELEVATION", 0),
-        "slope_mean": stats.get("SLOPE", 0),
+        "srtm_elevation_mean": stats.get("ELEVATION", 0),
+        "srtm_slope_mean": stats.get("SLOPE", 0),
     }
 
     logger.info(
         "Satellite stats for region: NDVI=%.3f, EVI=%.3f, GEDI=%.1f m, "
         "elevation=%.0f m, VH=%.1f dB",
-        result["ndvi_mean"] or 0,
-        result["evi_mean"] or 0,
+        result["s2_ndvi_mean"] or 0,
+        result["s2_evi_mean"] or 0,
         result["gedi_height_mean"] or 0,
-        result["elevation_mean"] or 0,
-        result["s1_vh_mean"] or 0,
+        result["srtm_elevation_mean"] or 0,
+        result["s1_vh_mean_db"] or 0,
     )
     return result

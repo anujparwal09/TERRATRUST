@@ -1,16 +1,4 @@
-"""
-NISAR service — access NASA NISAR L-band SAR data via the Alaska
-Satellite Facility (ASF) search API.
-
-NISAR (NASA-ISRO Synthetic Aperture Radar) provides dual-frequency
-(L-band + S-band) SAR data ideal for biomass estimation in tropical
-and subtropical forests such as those found in Indian smallholdings.
-
-Uses
-----
-- ``asf_search`` library for granule discovery and download.
-- NASA Earthdata credentials from application settings.
-"""
+"""NISAR service for ASF granule search and download."""
 
 import logging
 import os
@@ -19,7 +7,6 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import asf_search as asf
-import numpy as np
 
 from app.config import settings
 
@@ -106,10 +93,8 @@ def search_nisar_granules(
     )
 
     # ASF search — NISAR uses platform "NISAR"
-    # Fallback to ALOS PALSAR-2 (L-band) if NISAR data not yet available
     results: List[asf.ASFProduct] = []
 
-    # Try NISAR first
     try:
         nisar_results = asf.search(
             platform=[asf.PLATFORM.NISAR],
@@ -121,25 +106,7 @@ def search_nisar_granules(
         results.extend(nisar_results)
         logger.info("Found %d NISAR granules.", len(nisar_results))
     except Exception as exc:
-        logger.warning("NISAR search failed (data may not be available yet): %s", exc)
-
-    # Fallback: ALOS PALSAR-2 (also L-band SAR, good for biomass)
-    if not results:
-        try:
-            palsar_results = asf.search(
-                platform=[asf.PLATFORM.ALOS],
-                intersectsWith=wkt,
-                start=start_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                end=end_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                maxResults=max_results,
-            )
-            results.extend(palsar_results)
-            logger.info(
-                "NISAR unavailable; found %d ALOS PALSAR-2 (L-band) granules.",
-                len(palsar_results),
-            )
-        except Exception as exc:
-            logger.warning("ALOS PALSAR-2 fallback search also failed: %s", exc)
+        logger.warning("NISAR search failed or returned no data: %s", exc)
 
     # Format results
     granules: List[Dict[str, Any]] = []
@@ -171,7 +138,7 @@ def download_nisar_scene(
     download_url: str,
     output_dir: Optional[str] = None,
 ) -> str:
-    """Download a NISAR / ALOS PALSAR granule to a local directory.
+    """Download a NISAR granule to a local directory.
 
     Parameters
     ----------
@@ -226,7 +193,7 @@ def extract_nisar_backscatter(
 ) -> Dict[str, Any]:
     """Extract L-band HH/HV backscatter statistics for biomass estimation.
 
-    This function searches for the most recent NISAR (or ALOS PALSAR-2)
+    This function searches for the most recent NISAR
     L-band scene covering the parcel and computes summary statistics
     useful for the fusion engine's biomass model.
 
@@ -258,7 +225,7 @@ def extract_nisar_backscatter(
     )
 
     if not granules:
-        logger.info("No NISAR / ALOS PALSAR L-band data available for this region.")
+        logger.info("No NISAR L-band data available for this region.")
         return {
             "available": False,
             "platform": None,

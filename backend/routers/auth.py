@@ -1,27 +1,82 @@
-"""
-Auth router — KYC endpoint.
-
-POST /api/v1/auth/kyc
-"""
+"""Authentication router aligned to the backend design document."""
 
 import hashlib
 import logging
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.database import supabase_client
 from app.dependencies import get_current_user
-from models.user import KYCRequest
+from models.user import (
+    AuthMeResponse,
+    KYCRequest,
+    KYCResponse,
+    WalletRecoveryRequest,
+    WalletRecoveryResponse,
+    WalletRegisterRequest,
+    WalletRegisterResponse,
+)
 
 logger = logging.getLogger("terratrust.auth")
 
 router = APIRouter()
 
+AADHAAR_RE = re.compile(r"^\d{12}$")
+WALLET_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
-@router.post("/kyc", status_code=status.HTTP_200_OK)
+
+def _same_wallet_address(left: str, right: str) -> bool:
+    """Compare EVM wallet addresses case-insensitively."""
+    return left.strip().lower() == right.strip().lower()
+
+
+def _validate_aadhaar_number(aadhaar_number: str) -> str:
+    """Validate Aadhaar format and raise the documented 400 response on failure."""
+    candidate = aadhaar_number.strip()
+    if not AADHAAR_RE.fullmatch(candidate):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Aadhaar number format",
+        )
+    return candidate
+
+
+def _validate_wallet_address(wallet_address: str) -> str:
+    """Validate wallet format and raise the documented 400 response on failure."""
+    candidate = wallet_address.strip()
+    if not WALLET_RE.fullmatch(candidate):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid wallet address format",
+        )
+    return candidate
+
+
+def _build_auth_me_response(current_user: Dict[str, Any]) -> AuthMeResponse:
+    """Convert a database user row into the documented response shape."""
+    return AuthMeResponse(
+        user_id=current_user["id"],
+        firebase_uid=current_user["firebase_uid"],
+        phone_number=current_user.get("phone_number"),
+        full_name=current_user.get("full_name"),
+        kyc_completed=bool(current_user.get("kyc_completed", False)),
+        wallet_address=current_user.get("wallet_address"),
+    )
+
+
+@router.get("/me", response_model=AuthMeResponse, status_code=status.HTTP_200_OK)
+async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Return the authenticated farmer profile state for mobile bootstrap."""
+    return _build_auth_me_response(current_user)
+
+
+@router.post("/kyc", response_model=KYCResponse, status_code=status.HTTP_200_OK)
 async def submit_kyc(
     body: KYCRequest,
-    user_id: str = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
     Complete KYC for the authenticated user.
@@ -31,37 +86,178 @@ async def submit_kyc(
     - Sets ``kyc_completed = true``.
     """
     try:
-        aadhaar_hash = hashlib.sha256(body.aadhaar_number.encode("utf-8")).hexdigest()
+        full_name = " ".join(body.full_name.split())
+        if len(full_name) < 2:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Full name must be at least 2 characters.",
+            )
+
+        aadhaar_number = _validate_aadhaar_number(body.aadhaar_number)
+        aadhaar_hash = hashlib.sha256(aadhaar_number.encode("utf-8")).hexdigest()
 
         update_data = {
-            "full_name": body.full_name,
+            "full_name": full_name,
             "aadhaar_hash": aadhaar_hash,
             "kyc_completed": True,
         }
 
-        response = (
+        (
             supabase_client.table("users")
             .update(update_data)
-            .eq("id", user_id)
+            .eq("id", current_user["id"])
             .execute()
         )
 
-        if not response.data:
-            # User row may not exist yet — upsert instead
-            insert_data = {
-                "id": user_id,
-                **update_data,
-            }
-            supabase_client.table("users").upsert(insert_data).execute()
-
-        logger.info("KYC completed for user %s", user_id)
-        return {"status": "success", "user_id": user_id}
+        logger.info("KYC completed for user %s", current_user["id"])
+        return KYCResponse(user_id=current_user["id"])
 
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("KYC submission failed for user %s: %s", user_id, exc)
+        logger.error("KYC submission failed for user %s: %s", current_user["id"], exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="KYC processing failed. Please try again.",
+        ) from exc
+
+
+@router.post(
+    "/register-wallet",
+    response_model=WalletRegisterResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def register_wallet(
+    body: WalletRegisterRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Store the farmer's public wallet address after silent wallet creation."""
+    try:
+        wallet_address = _validate_wallet_address(body.wallet_address)
+        current_wallet = current_user.get("wallet_address")
+        if current_wallet:
+            if _same_wallet_address(current_wallet, wallet_address):
+                return WalletRegisterResponse()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A wallet address is already registered for this user.",
+            )
+
+        existing_wallet = (
+            supabase_client.table("users")
+            .select("id, wallet_address")
+            .ilike("wallet_address", wallet_address)
+            .limit(1)
+            .execute()
+        )
+        if existing_wallet.data and existing_wallet.data[0]["id"] != current_user["id"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This wallet address is already registered to another user.",
+            )
+
+        (
+            supabase_client.table("users")
+            .update({"wallet_address": wallet_address})
+            .eq("id", current_user["id"])
+            .execute()
+        )
+        logger.info(
+            "Wallet registered for user %s: %s",
+            current_user["id"],
+            wallet_address,
+        )
+        return WalletRegisterResponse()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Wallet registration failed for user %s: %s", current_user["id"], exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Wallet registration failed. Please try again.",
+        ) from exc
+
+
+@router.post(
+    "/recover-wallet",
+    response_model=WalletRecoveryResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def recover_wallet(
+    body: WalletRecoveryRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Create an admin-assisted wallet recovery request."""
+    try:
+        if not current_user.get("kyc_completed"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="KYC must be completed before requesting wallet recovery.",
+            )
+
+        current_wallet = current_user.get("wallet_address")
+        if not current_wallet:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No existing wallet address is registered for this user.",
+            )
+
+        new_wallet_address = _validate_wallet_address(body.new_wallet_address)
+        if _same_wallet_address(current_wallet, new_wallet_address):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New wallet address must be different from the current wallet.",
+            )
+
+        pending_request = (
+            supabase_client.table("wallet_recovery_requests")
+            .select("id")
+            .eq("user_id", current_user["id"])
+            .eq("status", "PENDING")
+            .limit(1)
+            .execute()
+        )
+        if pending_request.data:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A wallet recovery request is already pending",
+            )
+
+        existing_wallet = (
+            supabase_client.table("users")
+            .select("id")
+            .ilike("wallet_address", new_wallet_address)
+            .limit(1)
+            .execute()
+        )
+        if existing_wallet.data and existing_wallet.data[0]["id"] != current_user["id"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This wallet address is already registered to another user.",
+            )
+
+        supabase_client.table("wallet_recovery_requests").insert(
+            {
+                "user_id": current_user["id"],
+                "old_wallet_address": current_wallet,
+                "new_wallet_address": new_wallet_address,
+                "status": "PENDING",
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).execute()
+
+        logger.info(
+            "Wallet recovery requested for user %s: %s -> %s",
+            current_user["id"],
+            current_wallet,
+            new_wallet_address,
+        )
+        return WalletRecoveryResponse()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Wallet recovery request failed for user %s: %s", current_user["id"], exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Wallet recovery request failed. Please try again.",
         ) from exc

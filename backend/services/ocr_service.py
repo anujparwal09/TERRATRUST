@@ -1,39 +1,29 @@
-"""
-OCR service — extract land-document fields using PaddleOCR PP-OCRv5.
+"""OCR service for structured land-document extraction via Cloud Vision."""
 
-Uses the Devanagari model so both English and Marathi/Hindi text
-on 7/12 extracts, property cards, etc. are handled.
-"""
+from __future__ import annotations
 
+import io
 import logging
 import re
 from typing import Any, Dict
 
 import cv2
+from google.cloud import vision
 import numpy as np
-from paddleocr import PaddleOCR
+from PIL import Image, ImageOps
 
 logger = logging.getLogger("terratrust.ocr")
 
-# ---------------------------------------------------------------------------
-# Initialise PaddleOCR lazily (expensive to start, may have version issues)
-# ---------------------------------------------------------------------------
-_ocr_engine = None
+_vision_client: vision.ImageAnnotatorClient | None = None
 
 
-def _get_ocr_engine():
-    """Lazy-initialise and return the PaddleOCR engine."""
-    global _ocr_engine
-    if _ocr_engine is None:
-        _ocr_engine = PaddleOCR(
-            text_recognition_model_name="devanagari_PP-OCRv5_mobile_rec",
-            use_doc_orientation_classify=True,
-            use_doc_unwarping=True,
-            use_textline_orientation=True,
-            device="cpu",
-        )
-        logger.info("PaddleOCR engine initialised.")
-    return _ocr_engine
+def _get_vision_client() -> vision.ImageAnnotatorClient:
+    """Lazy-initialise the Cloud Vision client."""
+    global _vision_client
+    if _vision_client is None:
+        _vision_client = vision.ImageAnnotatorClient()
+        logger.info("Google Cloud Vision client initialised.")
+    return _vision_client
 
 # ---------------------------------------------------------------------------
 # Regex patterns for field extraction (English + Marathi / Devanagari)
@@ -65,117 +55,117 @@ DISTRICT_RE = re.compile(
 )
 
 
-def preprocess_document_image(image_bytes: bytes) -> np.ndarray:
-    """Pre-process a raw document image for better OCR accuracy.
+def preprocess_document_image(image_bytes: bytes) -> bytes:
+    """Pre-process a raw document image for better Cloud Vision accuracy."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            upright_image = ImageOps.exif_transpose(image).convert("RGB")
+    except Exception as exc:
+        raise ValueError("Could not decode the uploaded image.") from exc
 
-    Steps
-    -----
-    1. Decode bytes → BGR image.
-    2. Convert to greyscale.
-    3. Adaptive thresholding for contrast normalisation.
-    4. Non-local means denoising.
-
-    Returns
-    -------
-    numpy.ndarray
-        Cleaned greyscale image suitable for PaddleOCR.
-    """
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Could not decode the uploaded image.")
-
-    grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.adaptiveThreshold(
-        grey, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
+    bgr_image = cv2.cvtColor(np.array(upright_image), cv2.COLOR_RGB2BGR)
+    grey = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+    thresholded = cv2.adaptiveThreshold(
+        grey,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        15,
     )
-    denoised = cv2.fastNlMeansDenoising(thresh, h=10)
-    return denoised
+    denoised = cv2.fastNlMeansDenoising(thresholded, h=10)
+
+    if min(denoised.shape[:2]) < 1200:
+        denoised = cv2.resize(
+            denoised,
+            None,
+            fx=1.5,
+            fy=1.5,
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    success, encoded = cv2.imencode(".png", denoised)
+    if not success:
+        raise ValueError("Could not prepare the uploaded image for OCR.")
+    return encoded.tobytes()
 
 
-def extract_fields_from_document(image_bytes: bytes) -> Dict[str, Any]:
-    """Run OCR on a land document and extract structured fields.
+def _run_document_ocr(image_bytes: bytes) -> str:
+    """Run Cloud Vision document OCR and return the extracted full text."""
+    response = _get_vision_client().document_text_detection(
+        image=vision.Image(content=image_bytes)
+    )
+    if response.error.message:
+        raise RuntimeError(f"Cloud Vision OCR failed: {response.error.message}")
+    return (response.full_text_annotation.text or "").strip()
 
-    Parameters
-    ----------
-    image_bytes : bytes
-        Raw bytes of the uploaded document image.
 
-    Returns
-    -------
-    dict
-        Extracted fields: survey_number, owner_name, village,
-        taluka, district, and extraction_confidence (0–1).
-
-    Raises
-    ------
-    ValueError
-        If the mandatory ``survey_number`` or ``owner_name`` cannot
-        be found in the document.
-    """
-    processed = preprocess_document_image(image_bytes)
-
-    # PaddleOCR expects a numpy array (BGR or greyscale)
-    result = _get_ocr_engine().predict(processed)
-
-    # Assemble all recognised text lines into a single string
-    all_text_lines: list[str] = []
-    if result and len(result) > 0:
-        for item in result:
-            if hasattr(item, "rec_texts"):
-                all_text_lines.extend(item.rec_texts)
-            elif isinstance(item, dict) and "rec_texts" in item:
-                all_text_lines.extend(item["rec_texts"])
-            elif isinstance(item, (list, tuple)):
-                for sub in item:
-                    if isinstance(sub, (list, tuple)) and len(sub) >= 2:
-                        text = sub[1] if isinstance(sub[1], str) else str(sub[1][0]) if isinstance(sub[1], (list, tuple)) else str(sub[1])
-                        all_text_lines.append(text)
-                    elif isinstance(sub, str):
-                        all_text_lines.append(sub)
-
-    full_text = " ".join(all_text_lines)
-    logger.debug("OCR full text: %s", full_text[:500])
-
-    # --- Extract fields ------------------------------------------------
+def _extract_fields_from_text(full_text: str) -> Dict[str, Any]:
+    """Extract structured 7/12 fields from OCR text."""
     fields: Dict[str, Any] = {
         "survey_number": None,
         "owner_name": None,
         "village": None,
         "taluka": None,
         "district": None,
+        "state": "Maharashtra",
     }
 
-    m = SURVEY_RE.search(full_text)
-    if m:
-        fields["survey_number"] = m.group(1).strip()
+    match = SURVEY_RE.search(full_text)
+    if match:
+        fields["survey_number"] = match.group(1).strip()
 
-    m = OWNER_RE.search(full_text)
-    if m:
-        fields["owner_name"] = m.group(1).strip()
+    match = OWNER_RE.search(full_text)
+    if match:
+        fields["owner_name"] = " ".join(match.group(1).split())
 
-    m = VILLAGE_RE.search(full_text)
-    if m:
-        fields["village"] = m.group(1).strip()
+    match = VILLAGE_RE.search(full_text)
+    if match:
+        fields["village"] = " ".join(match.group(1).split())
 
-    m = TALUKA_RE.search(full_text)
-    if m:
-        fields["taluka"] = m.group(1).strip()
+    match = TALUKA_RE.search(full_text)
+    if match:
+        fields["taluka"] = " ".join(match.group(1).split())
 
-    m = DISTRICT_RE.search(full_text)
-    if m:
-        fields["district"] = m.group(1).strip()
+    match = DISTRICT_RE.search(full_text)
+    if match:
+        fields["district"] = " ".join(match.group(1).split())
 
-    # --- Confidence calculation ----------------------------------------
-    filled = sum(1 for v in fields.values() if v)
-    fields["extraction_confidence"] = round(filled / 5, 2)
+    filled_fields = sum(
+        1 for key in ("survey_number", "owner_name", "village", "taluka", "district")
+        if fields.get(key)
+    )
+    fields["extraction_confidence"] = round(filled_fields / 5, 2)
+    fields["filled_fields"] = filled_fields
+    return fields
 
-    # --- Mandatory field check -----------------------------------------
-    if not fields["survey_number"] or not fields["owner_name"]:
-        raise ValueError(
-            "Could not extract required fields from the document. "
-            f"survey_number={'found' if fields['survey_number'] else 'MISSING'}, "
-            f"owner_name={'found' if fields['owner_name'] else 'MISSING'}."
+
+def extract_fields_from_document(image_bytes: bytes) -> Dict[str, Any]:
+    """Run Cloud Vision OCR on a land document and extract structured fields."""
+    processed_bytes = preprocess_document_image(image_bytes)
+
+    processed_text = _run_document_ocr(processed_bytes)
+    processed_fields = _extract_fields_from_text(processed_text)
+
+    if processed_fields["survey_number"] and processed_fields["owner_name"]:
+        best_fields = processed_fields
+    else:
+        original_text = _run_document_ocr(image_bytes)
+        original_fields = _extract_fields_from_text(original_text)
+        best_fields = max(
+            (processed_fields, original_fields),
+            key=lambda item: (
+                int(bool(item.get("survey_number"))) + int(bool(item.get("owner_name"))),
+                item.get("filled_fields", 0),
+            ),
         )
 
-    return fields
+    if not best_fields["survey_number"] or not best_fields["owner_name"]:
+        raise ValueError(
+            "Could not extract required fields from the document. "
+            f"survey_number={'found' if best_fields['survey_number'] else 'missing'}, "
+            f"owner_name={'found' if best_fields['owner_name'] else 'missing'}."
+        )
+
+    best_fields.pop("filled_fields", None)
+    return best_fields

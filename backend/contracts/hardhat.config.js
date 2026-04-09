@@ -19,10 +19,10 @@ module.exports = {
     ]
   },
 
-  defaultNetwork: "polygonAmoy",
+  defaultNetwork: "hardhat",
 
   networks: {
-    polygonAmoy: {
+    polygon_amoy: {
       url: process.env.ALCHEMY_POLYGON_AMOY_URL || "",
       accounts: process.env.ADMIN_WALLET_PRIVATE_KEY
         ? [process.env.ADMIN_WALLET_PRIVATE_KEY]
@@ -31,19 +31,19 @@ module.exports = {
     }
   },
 
-etherscan: {
-  apiKey: process.env.POLYGONSCAN_API_KEY,
-  customChains: [
-    {
-      network: "polygonAmoy",
-      chainId: 80002,
-      urls: {
-        apiURL: "https://api-amoy.polygonscan.com/api",
-        browserURL: "https://amoy.polygonscan.com"
+  etherscan: {
+    apiKey: process.env.POLYGONSCAN_API_KEY,
+    customChains: [
+      {
+        network: "polygon_amoy",
+        chainId: 80002,
+        urls: {
+          apiURL: "https://api-amoy.polygonscan.com/api",
+          browserURL: "https://amoy.polygonscan.com"
+        }
       }
-    }
-  ]
-},
+    ]
+  },
 
   paths: {
     sources: "./contracts",

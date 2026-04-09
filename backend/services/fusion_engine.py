@@ -1,21 +1,12 @@
-"""
-Fusion engine — the scientific core of TerraTrust-AR.
-
-Combines Sentinel-1 SAR, Sentinel-2 optical, GEDI LiDAR,
-SRTM terrain data, and field AR-scanned tree measurements to
-estimate above-ground biomass (AGB) using the Chave allometric
-equation, then trains an XGBoost regressor on GEE to extrapolate
-across the entire parcel.
-"""
+"""Fusion engine implementing the documented satellite + field workflow."""
 
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 import ee
 
-from app.config import settings
 from app.database import supabase_client
+from app.gee import ensure_gee_initialized
 
 logger = logging.getLogger("terratrust.fusion")
 
@@ -42,16 +33,48 @@ DEFAULT_WOOD_DENSITY: float = 0.58
 
 def _ensure_gee() -> None:
     """Initialise GEE if not already done."""
+    ensure_gee_initialized()
+
+
+def _extract_scan_gps(scan: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    """Return ``(lat, lng)`` from either nested or flattened scan payloads."""
+    gps = scan.get("gps")
+    if isinstance(gps, dict):
+        lat = gps.get("lat")
+        lng = gps.get("lng")
+    else:
+        lat = scan.get("lat")
+        lng = scan.get("lng")
+
     try:
-        ee.Number(1).getInfo()
+        return float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _sample_gedi_height(gedi_image: ee.Image, lat: float, lng: float) -> Optional[float]:
+    """Sample GEDI height at a tree location, returning ``None`` when absent."""
+    try:
+        feature = gedi_image.sample(
+            region=ee.Geometry.Point([lng, lat]),
+            scale=25,
+        ).first()
+        if feature is None:
+            return None
+
+        sample_info = feature.getInfo() or {}
+        properties = sample_info.get("properties", {})
+        value = properties.get("GEDI_RH98")
+        if value is None:
+            value = properties.get("GEDI_HEIGHT")
+
+        if value is None:
+            return None
+
+        height = float(value)
+        return height if height > 0 else None
     except Exception:
-        kp = settings.GEE_SERVICE_ACCOUNT_KEY_PATH
-        email = settings.GEE_SERVICE_ACCOUNT_EMAIL
-        if kp and os.path.exists(kp):
-            credentials = ee.ServiceAccountCredentials(email, kp)
-            ee.Initialize(credentials)
-        else:
-            raise RuntimeError("GEE service-account key not found.")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -93,15 +116,13 @@ def run_fusion(
     geom_type = land_boundary_geojson.get("type", "Polygon")
     if geom_type == "Polygon":
         region = ee.Geometry.Polygon(coords)
-    else:
+    elif geom_type == "MultiPolygon":
         region = ee.Geometry.MultiPolygon(coords)
+    else:
+        raise ValueError(f"Unsupported geometry type: {geom_type}")
 
-    from datetime import datetime, timedelta
-
-    end = datetime.utcnow()
-    start = end - timedelta(days=180)
-    date_start = start.strftime("%Y-%m-%d")
-    date_end = end.strftime("%Y-%m-%d")
+    date_start = f"{audit_year}-01-01"
+    date_end = f"{audit_year}-12-31"
 
     # -----------------------------------------------------------------------
     # 1. Sentinel-1 (VH, VV) — speckle filtered
@@ -118,6 +139,9 @@ def run_fusion(
     )
     # Speckle filter — focal median 3×3
     s1_filtered = s1.focal_median(3, "square", "pixels")
+    s1_vh = s1_filtered.select("VH").rename("S1_VH")
+    s1_vv = s1_filtered.select("VV").rename("S1_VV")
+    s1_ratio = s1_vh.divide(s1_vv).rename("S1_VH_VV_RATIO")
 
     # -----------------------------------------------------------------------
     # 2. Sentinel-2 optical — cloud-filtered median composite
@@ -167,37 +191,67 @@ def run_fusion(
     # 6. Stack all bands into a single feature image
     # -----------------------------------------------------------------------
     feature_stack = ee.Image.cat(
-        [s1_filtered, ndvi, evi, red_edge, gedi, srtm, slope]
+        [s1_vh, s1_vv, s1_ratio, ndvi, evi, red_edge, gedi, srtm, slope]
     ).clip(region)
 
     # -----------------------------------------------------------------------
     # 7. Compute per-tree AGB using Chave allometric equation
     # -----------------------------------------------------------------------
     training_points: List[ee.Feature] = []
-    satellite_vh_accum = 0.0
-    ndvi_accum = 0.0
-    gedi_height_accum = 0.0
-    n_trees = len(tree_scans)
+    tree_measurements: List[Dict[str, Any]] = []
+    skipped_scans = 0
 
     for scan in tree_scans:
         species = scan.get("species", "Unknown")
         dbh_cm = float(scan["dbh_cm"])
-        height_m = scan.get("gedi_height_m") or scan.get("height_m") or 10.0
+        lat, lng = _extract_scan_gps(scan)
+        if lat is None or lng is None:
+            skipped_scans += 1
+            logger.warning(
+                "Skipping tree scan %s because GPS coordinates are missing.",
+                scan.get("id"),
+            )
+            continue
+
+        gedi_height_m = scan.get("gedi_height_m")
+        if gedi_height_m is None:
+            gedi_height_m = _sample_gedi_height(gedi, lat, lng)
+
+        height_m = gedi_height_m if gedi_height_m is not None else scan.get("height_m")
+        if height_m is None or float(height_m) <= 0:
+            skipped_scans += 1
+            logger.warning(
+                "Skipping tree scan %s because neither GEDI nor AR fallback height is available.",
+                scan.get("id"),
+            )
+            continue
+
+        height_source = "GEDI" if gedi_height_m else "AR_FALLBACK"
         wood_density = SPECIES_WOOD_DENSITY.get(species, DEFAULT_WOOD_DENSITY)
 
         # Chave et al. (2014) pan-tropical equation
         agb_kg = 0.0673 * (wood_density * (dbh_cm**2) * height_m) ** 0.976
         agb_t_ha = (agb_kg / 1000) / 0.01  # per-tree → tonnes per hectare (0.01 ha plot)
 
-        gps = scan.get("gps", {})
-        lat = gps.get("lat", 0)
-        lng = gps.get("lng", 0)
-
         point = ee.Feature(
             ee.Geometry.Point([lng, lat]),
             {"AGB_THA": agb_t_ha},
         )
         training_points.append(point)
+        tree_measurements.append(
+            {
+                "id": scan.get("id"),
+                "gedi_height_m": gedi_height_m,
+                "height_source": height_source,
+                "agb_kg": round(agb_kg, 4),
+            }
+        )
+
+    if len(training_points) < 9:
+        raise ValueError(
+            "Minimum 9 tree samples with valid GPS and height data are required for fusion. "
+            f"Received {len(training_points)} valid sample(s); skipped {skipped_scans}."
+        )
 
     # -----------------------------------------------------------------------
     # 8. Train XGBoost regressor on GEE
@@ -205,7 +259,7 @@ def run_fusion(
     training_fc = ee.FeatureCollection(training_points)
 
     band_names = [
-        "VH", "VV", "NDVI", "EVI", "RED_EDGE", "GEDI_RH98",
+        "S1_VH", "S1_VV", "S1_VH_VV_RATIO", "NDVI", "EVI", "RED_EDGE", "GEDI_RH98",
         "ELEVATION", "SLOPE",
     ]
 
@@ -213,7 +267,7 @@ def run_fusion(
         collection=training_fc,
         properties=["AGB_THA"],
         scale=10,
-    )
+    ).filter(ee.Filter.notNull(band_names + ["AGB_THA"]))
 
     classifier = (
         ee.Classifier.smileGradientTreeBoost(
@@ -264,19 +318,26 @@ def run_fusion(
         "Fusion complete for audit %s: total_biomass=%.2f tonnes, %d training points",
         audit_id,
         total_biomass,
-        n_trees,
+        len(training_points),
     )
 
     return {
         "total_biomass_tonnes": round(total_biomass, 4),
-        "training_points_count": n_trees,
+        "training_points_count": len(training_points),
+        "tree_measurements": tree_measurements,
         "satellite_features": {
-            "s1_vh_mean": sat_stats.get("VH", 0),
-            "ndvi_mean": sat_stats.get("NDVI", 0),
+            "s1_vh_mean_db": sat_stats.get("S1_VH", 0),
+            "s1_vv_mean_db": sat_stats.get("S1_VV", 0),
+            "s1_vh_vv_ratio_mean": sat_stats.get("S1_VH_VV_RATIO", 0),
+            "s2_ndvi_mean": sat_stats.get("NDVI", 0),
+            "s2_evi_mean": sat_stats.get("EVI", 0),
+            "s2_red_edge_mean": sat_stats.get("RED_EDGE", 0),
             "gedi_height_mean": sat_stats.get("GEDI_RH98", 0),
-            "evi_mean": sat_stats.get("EVI", 0),
-            "elevation_mean": sat_stats.get("ELEVATION", 0),
-            "slope_mean": sat_stats.get("SLOPE", 0),
+            "srtm_elevation_mean": sat_stats.get("ELEVATION", 0),
+            "srtm_slope_mean": sat_stats.get("SLOPE", 0),
+            "nisar_used": False,
+            "features_count": len(band_names),
+            "processing_method": "S1_S2_GEDI_SRTM_XGBoost_v3.1",
         },
     }
 
@@ -308,30 +369,55 @@ def calculate_credits(
     """
     # --- Look up previous year's biomass -----------------------------------
     previous_biomass: float = 0.0
+    previous_audit_found = False
     try:
         prev_resp = (
             supabase_client.table("carbon_audits")
-            .select("total_biomass_tonnes")
+            .select("total_biomass_tonnes, status")
             .eq("land_id", land_id)
-            .eq("audit_year", audit_year - 1)
-            .eq("status", "MINTED")
+            .lt("audit_year", audit_year)
+            .order("audit_year", desc=True)
             .order("created_at", desc=True)
-            .limit(1)
+            .limit(10)
             .execute()
         )
-        if prev_resp.data:
-            previous_biomass = float(prev_resp.data[0].get("total_biomass_tonnes", 0))
+        previous_audit = next(
+            (
+                row
+                for row in (prev_resp.data or [])
+                if row.get("status") in {"MINTED", "COMPLETE_NO_CREDITS"}
+            ),
+            None,
+        )
+        if previous_audit:
+            previous_audit_found = True
+            previous_biomass = float(previous_audit.get("total_biomass_tonnes", 0))
     except Exception as exc:
         logger.warning("Could not fetch previous biomass for land %s: %s", land_id, exc)
+
+    if not previous_audit_found:
+        return {
+            "credits_issued": 0,
+            "delta_biomass": 0,
+            "carbon_tonnes": 0,
+            "co2_equivalent": 0,
+            "reason": "Baseline year established; future growth earns credits.",
+            "prev_year_biomass": 0,
+            "previous_biomass": 0,
+            "current_biomass": total_biomass_tonnes,
+        }
 
     delta = total_biomass_tonnes - previous_biomass
 
     if delta <= 0:
+        no_growth_reason = "No biomass growth detected compared to the latest prior successful audit"
         return {
             "credits_issued": 0,
             "delta_biomass": round(delta, 4),
             "carbon_tonnes": 0,
             "co2_equivalent": 0,
+            "reason": no_growth_reason,
+            "prev_year_biomass": previous_biomass,
             "previous_biomass": previous_biomass,
             "current_biomass": total_biomass_tonnes,
         }
@@ -342,11 +428,11 @@ def calculate_credits(
     credits_issued = co2_equivalent
 
     logger.info(
-        "Credit calculation: delta=%.2f t, carbon=%.2f t, CO2e=%.2f t → %d credits",
+        "Credit calculation: delta=%.2f t, carbon=%.2f t, CO2e=%.2f t -> %.4f credits",
         delta,
         carbon_tonnes,
         co2_equivalent,
-        int(credits_issued),
+        credits_issued,
     )
 
     return {
@@ -354,6 +440,8 @@ def calculate_credits(
         "delta_biomass": round(delta, 4),
         "carbon_tonnes": round(carbon_tonnes, 4),
         "co2_equivalent": round(co2_equivalent, 4),
+        "reason": "Credits issued from year-over-year biomass growth.",
+        "prev_year_biomass": previous_biomass,
         "previous_biomass": previous_biomass,
         "current_biomass": total_biomass_tonnes,
     }

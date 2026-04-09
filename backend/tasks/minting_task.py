@@ -1,15 +1,13 @@
-"""
-Minting Celery task — mints carbon credits on Polygon and updates
-the audit record with the transaction hash.
-"""
+"""Background minting task for Polygon settlement and audit updates."""
 
 import asyncio
 import logging
 from datetime import datetime, timezone
+import uuid
 
 from tasks.celery_app import celery_app
-from app.database import supabase_client
-from services import fusion_engine, minting_service
+from app.database import fetch_land_parcel_record, list_tree_scans_for_audit, supabase_client
+from services import minting_service
 
 logger = logging.getLogger("terratrust.tasks.minting")
 
@@ -39,22 +37,17 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
         )
         audit_data = audit_resp.data
 
-        land_resp = (
-            supabase_client.table("land_parcels")
-            .select("*")
-            .eq("id", land_id)
-            .single()
-            .execute()
-        )
-        land_data = land_resp.data
+        if float(audit_data.get("credits_issued") or 0) <= 0:
+            supabase_client.table("carbon_audits").update(
+                {
+                    "status": "COMPLETE_NO_CREDITS",
+                    "reason": audit_data.get("reason") or "No eligible credits were generated for this audit.",
+                }
+            ).eq("id", audit_id).execute()
+            return {"audit_id": audit_id, "status": "COMPLETE_NO_CREDITS"}
 
-        scans_resp = (
-            supabase_client.table("ar_tree_scans")
-            .select("*")
-            .eq("audit_id", audit_id)
-            .execute()
-        )
-        tree_scans = scans_resp.data or []
+        land_data = asyncio.run(fetch_land_parcel_record(land_id))
+        tree_scans = asyncio.run(list_tree_scans_for_audit(audit_id))
 
         # Fetch user wallet address
         user_resp = (
@@ -73,7 +66,11 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
         # --- Build metadata -------------------------------------------------
         credit_result = {
             "credits_issued": audit_data.get("credits_issued", 0),
+            "prev_year_biomass": audit_data.get("prev_year_biomass", 0),
             "current_biomass": audit_data.get("total_biomass_tonnes", 0),
+            "delta_biomass": audit_data.get("delta_biomass", 0),
+            "carbon_tonnes": audit_data.get("carbon_tonnes", 0),
+            "co2_equivalent": audit_data.get("co2_equivalent", 0),
             "satellite_features": audit_data.get("satellite_features", {}),
         }
 
@@ -82,6 +79,10 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
                 "land_id": land_id,
                 "survey_number": land_data.get("survey_number"),
                 "district": land_data.get("district"),
+                "taluka": land_data.get("taluka"),
+                "village": land_data.get("village"),
+                "boundary_source": land_data.get("boundary_source"),
+                "boundary_geojson": land_data.get("boundary_geojson") or land_data.get("geojson"),
                 "audit_year": audit_year,
             },
             tree_scans=tree_scans,
@@ -89,29 +90,27 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
         )
 
         # --- Mint on-chain --------------------------------------------------
-        # minting_service.mint_carbon_credits is async; run it in an event loop
-        loop = asyncio.new_event_loop()
-        try:
-            mint_result = loop.run_until_complete(
-                minting_service.mint_carbon_credits(
-                    farmer_address=farmer_address,
-                    audit_id_int=audit_data.get("audit_id_int", hash(audit_id) % (10**8)),
-                    credit_amount=audit_data.get("credits_issued", 0),
-                    metadata=metadata,
-                    land_id=land_id,
-                    audit_year=audit_year,
-                )
+        mint_result = asyncio.run(
+            minting_service.mint_carbon_credits(
+                farmer_address=farmer_address,
+                audit_id_int=uuid.UUID(audit_id).int,
+                credit_amount=audit_data.get("credits_issued", 0),
+                metadata=metadata,
+                land_id=land_id,
+                audit_year=audit_year,
             )
-        finally:
-            loop.close()
+        )
 
         # --- Update audit record --------------------------------------------
+        ipfs_uri = mint_result["ipfs_url"]
         supabase_client.table("carbon_audits").update(
             {
                 "status": "MINTED",
                 "tx_hash": mint_result["tx_hash"],
+                "ipfs_metadata_cid": ipfs_uri.removeprefix("ipfs://"),
                 "ipfs_url": mint_result["ipfs_url"],
                 "block_number": mint_result["block_number"],
+                "token_id": uuid.UUID(audit_id).int,
                 "minted_at": datetime.now(timezone.utc).isoformat(),
             }
         ).eq("id", audit_id).execute()

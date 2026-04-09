@@ -1,189 +1,190 @@
-# TerraTrust-AR Backend — Setup Guide
+# TerraTrust-AR Backend Setup Guide
 
 ## Prerequisites
 
-- **Python 3.12+**
-- **Redis** (running locally or a managed instance)
-- **Node.js 18+** (only for smart contract deployment)
-- A **Supabase** project with PostgreSQL + PostGIS enabled
-- A **Google Earth Engine** service account
-- A **Pinata** account for IPFS pinning
-- A **Polygon** wallet with MATIC (Amoy testnet or mainnet)
+- Python 3.11+
+- Redis running locally or as a managed instance
+- Node.js 18+ for contract tooling
+- Supabase with PostgreSQL 15 and PostGIS enabled
+- Firebase project with Phone Auth enabled
+- Shared Google backend service account JSON for Firebase Admin, Cloud Vision, and Earth Engine
+- Pinata account for IPFS pinning
+- Polygon Amoy admin wallet funded with test POL
 
----
+## 1. Create and activate a virtual environment
 
-## 1. Create a virtual environment
+Windows:
 
 ```bash
 python -m venv venv
-```
-
-## 2. Activate the virtual environment
-
-**Windows:**
-```bash
 venv\Scripts\activate
 ```
 
-**macOS / Linux:**
+macOS / Linux:
+
 ```bash
+python3 -m venv venv
 source venv/bin/activate
 ```
 
-## 3. Install Python dependencies
+## 2. Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 4. Configure environment variables
+Install the Chromium browser used by the Layer 2 Playwright boundary scraper:
+
+```bash
+playwright install chromium
+```
+
+## 3. Configure environment variables
+
+Create `.env` from `.env.example` and fill every required variable.
+
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+macOS / Linux:
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and fill in **all** values:
+Important variables:
 
 | Variable | Description |
 |---|---|
-| `SUPABASE_URL` | Your Supabase project URL |
+| `FIREBASE_PROJECT_ID` | Firebase project ID used by the mobile app |
+| `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SERVICE_KEY` | Supabase service role key |
-| `GEE_SERVICE_ACCOUNT_EMAIL` | GEE service account email |
-| `GEE_SERVICE_ACCOUNT_KEY_PATH` | Path to GEE JSON key file |
-| `ADMIN_WALLET_PRIVATE_KEY` | Polygon wallet private key |
-| `ADMIN_WALLET_ADDRESS` | Polygon wallet address |
-| `ALCHEMY_POLYGON_AMOY_URL` | Alchemy RPC URL (testnet) |
-| `CONTRACT_ADDRESS` | Deployed TerraToken address |
-| `PINATA_JWT` | Pinata JWT for IPFS |
-| `REDIS_URL` | Redis connection URL |
+| `DATABASE_URL` | Direct PostgreSQL connection string used for PostGIS geometry queries |
+| `GOOGLE_CLOUD_PROJECT` | Shared Google Cloud project ID used by Firebase Admin, Cloud Vision, and Earth Engine |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to the shared backend Google service account JSON |
+| `NASA_EARTHDATA_USERNAME` | Earthdata username for ASF access |
+| `NASA_EARTHDATA_PASSWORD` | Earthdata password for ASF access |
+| `ADMIN_WALLET_PRIVATE_KEY` | Polygon Amoy admin private key |
+| `ADMIN_WALLET_ADDRESS` | Polygon Amoy admin public wallet |
+| `ALCHEMY_POLYGON_AMOY_URL` | Alchemy Polygon Amoy RPC URL |
+| `CONTRACT_ADDRESS` | Deployed ERC-1155 contract address |
+| `PINATA_JWT` | Pinata JWT used for metadata pinning |
+| `PINATA_GATEWAY_URL` | Pinata gateway domain used for certificate URLs |
+| `POLYGONSCAN_API_KEY` | PolygonScan API key for verification |
+| `LGD_API_BASE` | Government LGD API base URL |
+| `REDIS_URL` | Redis broker/result backend URL |
 
-## 5. Place the GEE service account key
+## 4. Place the shared Google service account key
 
-Copy your Google Earth Engine service account JSON key file into the `backend/` folder:
+Put this file in the `backend/` directory or adjust the path in `.env`:
 
-```
-backend/gee-service-account.json
-```
+- `backend-google-service-account.json`
 
-## 6. Set up Supabase tables
+Get `DATABASE_URL` from Supabase:
 
-Create the following tables in your Supabase SQL Editor:
+1. Open Supabase Dashboard.
+2. Go to `Project Settings` -> `Database`.
+3. Copy the PostgreSQL connection string.
+4. Convert it to the async format if needed:
+    `postgresql://...` -> `postgresql+asyncpg://...`
+
+`DATABASE_URL` is required for the documented PostGIS-backed land, zone, and tree-scan flows.
+
+`GOOGLE_APPLICATION_CREDENTIALS` is the single shared credential consumed by Firebase Admin, Google Cloud Vision, and Google Earth Engine.
+
+## 5. Enable PostGIS in Supabase
+
+Run this in the Supabase SQL editor:
 
 ```sql
--- Users
-CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY,
-    full_name TEXT,
-    aadhaar_hash TEXT,
-    phone TEXT,
-    wallet_address TEXT,
-    kyc_completed BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Land parcels
-CREATE TABLE IF NOT EXISTS land_parcels (
-    id UUID PRIMARY KEY,
-    user_id UUID REFERENCES users(id),
-    farm_name TEXT NOT NULL,
-    survey_number TEXT NOT NULL,
-    district TEXT,
-    taluka TEXT,
-    village TEXT,
-    state TEXT,
-    boundary_source TEXT,
-    geojson JSONB,
-    area_hectares DOUBLE PRECISION,
-    status TEXT DEFAULT 'verified',
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(user_id, survey_number)
-);
-
--- Carbon audits
-CREATE TABLE IF NOT EXISTS carbon_audits (
-    id UUID PRIMARY KEY,
-    land_id UUID REFERENCES land_parcels(id),
-    user_id UUID REFERENCES users(id),
-    audit_year INTEGER,
-    status TEXT DEFAULT 'PROCESSING',
-    zones JSONB,
-    total_biomass_tonnes DOUBLE PRECISION,
-    credits_issued DOUBLE PRECISION,
-    delta_biomass DOUBLE PRECISION,
-    carbon_tonnes DOUBLE PRECISION,
-    co2_equivalent DOUBLE PRECISION,
-    satellite_features JSONB,
-    tx_hash TEXT,
-    ipfs_url TEXT,
-    block_number BIGINT,
-    error TEXT,
-    calculated_at TIMESTAMPTZ,
-    minted_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- AR tree scans
-CREATE TABLE IF NOT EXISTS ar_tree_scans (
-    id UUID PRIMARY KEY,
-    audit_id UUID REFERENCES carbon_audits(id),
-    zone_id TEXT,
-    species TEXT,
-    dbh_cm DOUBLE PRECISION,
-    height_m DOUBLE PRECISION,
-    gps JSONB,
-    ar_tier_used INTEGER,
-    confidence_score DOUBLE PRECISION,
-    evidence_photo_hash TEXT,
-    evidence_photo_path TEXT,
-    wood_density DOUBLE PRECISION,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS postgis_topology;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 ```
 
-## 7. Deploy the smart contract (optional — for minting)
+## 6. Create the documented backend schema
+
+Run the checked-in `schema.sql` file in the Supabase SQL Editor. This file is the canonical backend schema and is kept aligned with the runtime models and database helpers.
+
+Windows PowerShell:
+
+```powershell
+Get-Content .\schema.sql -Raw
+```
+
+Then paste the output into the Supabase SQL Editor and run it.
+
+## 7. Create required Supabase storage buckets
+
+Create these private buckets:
+
+- `land-documents`
+- `evidence-photos`
+
+## 8. Deploy the smart contract
 
 ```bash
 cd contracts
-npm init -y
-npm install --save-dev @nomicfoundation/hardhat-toolbox hardhat dotenv @openzeppelin/contracts
+npm install
 npx hardhat compile
-npx hardhat run scripts/deploy.js --network polygonAmoy
+npx hardhat run scripts/deploy.js --network polygon_amoy
 ```
 
-Copy the deployed contract address into your `.env` as `CONTRACT_ADDRESS`.
+Copy the deployed contract address into `.env` as `CONTRACT_ADDRESS`.
 
-## 8. Start the API server
+Optional verification:
+
+```bash
+npx hardhat verify --network polygon_amoy <CONTRACT_ADDRESS>
+```
+
+## 9. Start the API server
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## 9. Start the Celery worker (separate terminal)
+## 10. Start the Celery worker
 
 ```bash
 celery -A tasks.celery_app worker --loglevel=info
 ```
 
-## 10. Verify
+## 11. Run tests
 
-Open the interactive API docs:
+Python tests:
 
-👉 **http://localhost:8000/docs**
+```bash
+python -m pytest tests -q
+```
 
-All endpoints should be visible and testable.
+Contract tests:
 
----
+```bash
+cd contracts
+npx hardhat test
+```
 
-## API Endpoints Summary
+## 12. Verify the backend
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Health check |
-| `POST` | `/api/v1/auth/kyc` | Submit KYC |
-| `POST` | `/api/v1/land/verify-document` | OCR land document |
-| `GET` | `/api/v1/land/fetch-boundary` | Auto-fetch boundary |
-| `POST` | `/api/v1/land/register` | Register land parcel |
-| `GET` | `/api/v1/audit/zones` | Generate sampling zones |
-| `POST` | `/api/v1/audit/submit-samples` | Submit tree scans |
-| `GET` | `/api/v1/audit/result/{audit_id}` | Get audit result |
-| `GET` | `/api/v1/credits/balance` | Get credit balance |
+Open the API docs at http://localhost:8000/docs and confirm these endpoints are present:
+
+- `GET /api/v1/auth/me`
+- `POST /api/v1/auth/kyc`
+- `POST /api/v1/auth/register-wallet`
+- `POST /api/v1/auth/recover-wallet`
+- `POST /api/v1/land/verify-document`
+- `GET /api/v1/land/fetch-boundary`
+- `POST /api/v1/land/register`
+- `GET /api/v1/land/list`
+- `PATCH /api/v1/land/{land_id}`
+- `GET /api/v1/audit/zones`
+- `POST /api/v1/audit/submit-samples`
+- `GET /api/v1/audit/result/{audit_id}`
+- `GET /api/v1/audit/history/{land_id}`
+- `GET /api/v1/credits/balance`
+- `GET /health`
+- `GET /api/v1/status`

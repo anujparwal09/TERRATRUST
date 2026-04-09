@@ -1,13 +1,16 @@
-"""
-Fusion Celery task — runs the data fusion + credit calculation
-pipeline in the background and triggers minting if credits > 0.
-"""
+"""Background fusion task for audit calculation and minting handoff."""
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
 from tasks.celery_app import celery_app
-from app.database import supabase_client
+from app.database import (
+    fetch_land_parcel_record,
+    list_tree_scans_for_audit,
+    supabase_client,
+    update_tree_scan_measurements,
+)
 from services import fusion_engine
 
 logger = logging.getLogger("terratrust.tasks.fusion")
@@ -24,7 +27,7 @@ def run_audit_fusion(self, audit_id: str) -> dict:
     3. Run ``fusion_engine.run_fusion()``.
     4. Run ``fusion_engine.calculate_credits()``.
     5. Persist results in ``carbon_audits``.
-    6. If credits > 0 → trigger ``minting_task``.
+    6. Trigger ``minting_task`` to mint the audit certificate and any credits.
 
     On exception the task retries up to 2 times with a 30 s delay,
     then marks the audit ``FAILED``.
@@ -49,24 +52,13 @@ def run_audit_fusion(self, audit_id: str) -> dict:
         audit_year = audit_data.get("audit_year", datetime.now(timezone.utc).year)
 
         # Fetch land boundary
-        land_resp = (
-            supabase_client.table("land_parcels")
-            .select("geojson, survey_number, district")
-            .eq("id", land_id)
-            .single()
-            .execute()
-        )
-        land_data = land_resp.data
-        boundary_geojson = land_data["geojson"]
+        land_data = asyncio.run(fetch_land_parcel_record(land_id))
+        boundary_geojson = land_data.get("boundary_geojson")
+        if not boundary_geojson:
+            raise ValueError(f"Land parcel {land_id} is missing boundary geometry.")
 
         # Fetch tree scans
-        scans_resp = (
-            supabase_client.table("ar_tree_scans")
-            .select("*")
-            .eq("audit_id", audit_id)
-            .execute()
-        )
-        tree_scans = scans_resp.data or []
+        tree_scans = asyncio.run(list_tree_scans_for_audit(audit_id))
 
         # --- 3. Run fusion --------------------------------------------------
         fusion_result = fusion_engine.run_fusion(
@@ -84,24 +76,41 @@ def run_audit_fusion(self, audit_id: str) -> dict:
             audit_year=audit_year,
         )
 
+        asyncio.run(
+            update_tree_scan_measurements(fusion_result.get("tree_measurements", []))
+        )
+
         # --- 5. Persist results ---------------------------------------------
+        satellite_features = fusion_result.get("satellite_features", {})
         update_payload = {
             "total_biomass_tonnes": fusion_result["total_biomass_tonnes"],
             "credits_issued": credit_result["credits_issued"],
+            "prev_year_biomass": credit_result.get("prev_year_biomass"),
             "delta_biomass": credit_result["delta_biomass"],
             "carbon_tonnes": credit_result["carbon_tonnes"],
             "co2_equivalent": credit_result["co2_equivalent"],
-            "satellite_features": fusion_result.get("satellite_features"),
-            "status": "CALCULATED",
+            "satellite_features": satellite_features,
+            "s1_vh_mean_db": satellite_features.get("s1_vh_mean_db"),
+            "s1_vv_mean_db": satellite_features.get("s1_vv_mean_db"),
+            "s2_ndvi_mean": satellite_features.get("s2_ndvi_mean"),
+            "s2_evi_mean": satellite_features.get("s2_evi_mean"),
+            "gedi_height_mean": satellite_features.get("gedi_height_mean"),
+            "srtm_elevation_mean": satellite_features.get("srtm_elevation_mean"),
+            "srtm_slope_mean": satellite_features.get("srtm_slope_mean"),
+            "nisar_used": satellite_features.get("nisar_used", False),
+            "features_count": satellite_features.get("features_count"),
+            "trees_scanned_count": len(tree_scans),
+            "xgboost_model_version": satellite_features.get("processing_method", "S1_S2_GEDI_SRTM_XGBoost_v3.1"),
+            "reason": credit_result.get("reason"),
             "calculated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        supabase_client.table("carbon_audits").update(
-            update_payload
-        ).eq("id", audit_id).execute()
-
-        # --- 6. Trigger minting if credits > 0 -----------------------------
         if credit_result["credits_issued"] > 0:
+            update_payload["status"] = "READY_TO_MINT"
+            supabase_client.table("carbon_audits").update(
+                update_payload
+            ).eq("id", audit_id).execute()
+
             from tasks.minting_task import run_minting
 
             run_minting.delay(
@@ -115,13 +124,14 @@ def run_audit_fusion(self, audit_id: str) -> dict:
                 credit_result["credits_issued"],
             )
         else:
-            # No credits — mark as MINTED (nothing to mint)
+            update_payload["status"] = "COMPLETE_NO_CREDITS"
             supabase_client.table("carbon_audits").update(
-                {"status": "MINTED"}
+                update_payload
             ).eq("id", audit_id).execute()
             logger.info(
-                "Fusion done for audit %s — 0 credits (no biomass increase).",
+                "Fusion done for audit %s — no credits issued (%s).",
                 audit_id,
+                credit_result.get("reason", "no eligible biomass growth"),
             )
 
         return {

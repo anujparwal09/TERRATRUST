@@ -1,8 +1,4 @@
-"""
-IPFS service — upload JSON metadata and binary files to Pinata.
-
-Pinata is used instead of NFT.Storage (deprecated).
-"""
+"""IPFS service — upload audit metadata JSON to Pinata."""
 
 import logging
 from typing import Any, Dict
@@ -12,6 +8,17 @@ import httpx
 from app.config import settings
 
 logger = logging.getLogger("terratrust.ipfs")
+
+
+def _pinata_headers() -> Dict[str, str]:
+    """Return authenticated Pinata headers, failing clearly when unset."""
+    if not settings.PINATA_JWT:
+        raise RuntimeError("PINATA_JWT is not configured.")
+
+    return {
+        "Authorization": f"Bearer {settings.PINATA_JWT}",
+        "Content-Type": "application/json",
+    }
 
 
 async def upload_to_ipfs(metadata: Dict[str, Any], audit_id: str = "") -> str:
@@ -30,11 +37,9 @@ async def upload_to_ipfs(metadata: Dict[str, Any], audit_id: str = "") -> str:
         IPFS URI in the form ``ipfs://<CID>``.
     """
     url = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
-    headers = {
-        "Authorization": f"Bearer {settings.PINATA_JWT}",
-        "Content-Type": "application/json",
-    }
+    headers = _pinata_headers()
     body = {
+        "pinataOptions": {"cidVersion": 1},
         "pinataContent": metadata,
         "pinataMetadata": {"name": f"terratrust-audit-{audit_id}"},
     }
@@ -50,39 +55,24 @@ async def upload_to_ipfs(metadata: Dict[str, Any], audit_id: str = "") -> str:
     return ipfs_url
 
 
-async def upload_file_to_ipfs(file_bytes: bytes, filename: str) -> str:
-    """Pin a binary file to IPFS via Pinata.
+def to_gateway_url(ipfs_url: str | None) -> str | None:
+    """Convert an ``ipfs://`` URI into the configured Pinata gateway URL."""
+    if not ipfs_url:
+        return None
+    if ipfs_url.startswith("http://") or ipfs_url.startswith("https://"):
+        return ipfs_url
+    if not settings.PINATA_GATEWAY_URL:
+        return ipfs_url
 
-    Parameters
-    ----------
-    file_bytes : bytes
-        Raw file content.
-    filename : str
-        Human-readable filename for Pinata metadata.
+    cid = ipfs_url.strip()
+    if cid.startswith("ipfs://"):
+        cid = cid.removeprefix("ipfs://")
+    elif cid.startswith("/ipfs/"):
+        cid = cid.removeprefix("/ipfs/")
+    elif cid.startswith("ipfs/"):
+        cid = cid.removeprefix("ipfs/")
 
-    Returns
-    -------
-    str
-        IPFS URI in the form ``ipfs://<CID>``.
-    """
-    url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
-    headers = {
-        "Authorization": f"Bearer {settings.PINATA_JWT}",
-    }
+    if not cid:
+        return None
 
-    files = {
-        "file": (filename, file_bytes),
-    }
-    data = {
-        "pinataMetadata": '{"name": "' + filename + '"}',
-    }
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(url, files=files, data=data, headers=headers)
-        resp.raise_for_status()
-        resp_data = resp.json()
-
-    cid = resp_data["IpfsHash"]
-    ipfs_url = f"ipfs://{cid}"
-    logger.info("Pinned file '%s' to IPFS: %s", filename, ipfs_url)
-    return ipfs_url
+    return f"https://{settings.PINATA_GATEWAY_URL}/ipfs/{cid}"

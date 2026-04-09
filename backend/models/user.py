@@ -1,6 +1,4 @@
-"""
-Pydantic schemas for user / KYC data.
-"""
+"""Pydantic schemas for backend authentication and user profile APIs."""
 
 from pydantic import BaseModel, Field
 
@@ -8,20 +6,48 @@ from pydantic import BaseModel, Field
 class KYCRequest(BaseModel):
     """Request body for KYC verification."""
 
-    full_name: str = Field(..., min_length=2, max_length=200, description="Legal full name")
-    aadhaar_number: str = Field(
-        ...,
-        min_length=12,
-        max_length=12,
-        pattern=r"^\d{12}$",
-        description="12-digit Aadhaar number",
-    )
+    full_name: str = Field(..., description="Legal full name")
+    aadhaar_number: str = Field(..., description="12-digit Aadhaar number")
 
 
-class UserResponse(BaseModel):
-    """Public user representation."""
+class AuthMeResponse(BaseModel):
+    """Documented profile bootstrap response for ``GET /api/v1/auth/me``."""
 
-    id: str
-    phone: str | None = None
+    user_id: str
+    firebase_uid: str
+    phone_number: str | None = None
+    full_name: str | None = None
     wallet_address: str | None = None
     kyc_completed: bool = False
+
+
+class KYCResponse(BaseModel):
+    """Standard success response for KYC completion."""
+
+    status: str = "success"
+    user_id: str
+
+
+class WalletRegisterRequest(BaseModel):
+    """Request body used after the mobile app creates a farmer wallet."""
+
+    wallet_address: str = Field(..., description="Public Polygon wallet address")
+
+
+class WalletRegisterResponse(BaseModel):
+    """Standard success response for wallet registration."""
+
+    status: str = "success"
+
+
+class WalletRecoveryRequest(BaseModel):
+    """Request body for admin-assisted wallet recovery."""
+
+    new_wallet_address: str = Field(..., description="Replacement Polygon wallet address")
+
+
+class WalletRecoveryResponse(BaseModel):
+    """Pending response for wallet recovery requests."""
+
+    status: str = "pending"
+    message: str = "Wallet recovery request submitted"

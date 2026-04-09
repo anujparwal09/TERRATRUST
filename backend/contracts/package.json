@@ -6,7 +6,9 @@
   },
   "main": "hardhat.config.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "hardhat test",
+    "deploy:amoy": "hardhat run scripts/deploy.js --network polygon_amoy",
+    "verify:amoy": "hardhat verify --network polygon_amoy"
   },
   "dependencies": {
     "@openzeppelin/contracts": "^5.6.1",
