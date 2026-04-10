@@ -6,6 +6,8 @@ import json
 import logging
 from pathlib import Path
 from redis import Redis
+import threading
+import time
 import unicodedata
 import uuid
 from typing import Any, Dict, List
@@ -59,6 +61,8 @@ FETCH_BOUNDARY_RATE_LIMIT = RateLimitSpec(
 
 _pending_land_context_client: Redis | None = None
 _pending_land_context_initialised = False
+_pending_land_context_lock = threading.Lock()
+_pending_land_context_memory: dict[str, tuple[float, Dict[str, Any]]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -189,39 +193,123 @@ def _pending_land_context_key(user_id: str, survey_number: str) -> str:
     return f"pending-land-context:{user_id}:{survey_number.strip().lower()}"
 
 
+def _load_pending_context_payload(raw_value: str | None) -> Dict[str, Any]:
+    """Decode cached pending-context JSON safely."""
+    if not raw_value:
+        return {}
+
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError:
+        logger.warning("Discarding invalid pending land context payload.")
+        return {}
+
+    return payload if isinstance(payload, dict) else {}
+
+
+def _get_memory_pending_land_context(key: str) -> Dict[str, Any]:
+    """Return the in-memory fallback payload for a pending land registration."""
+    now = time.time()
+    with _pending_land_context_lock:
+        cached = _pending_land_context_memory.get(key)
+        if not cached:
+            return {}
+
+        expires_at, payload = cached
+        if now >= expires_at:
+            _pending_land_context_memory.pop(key, None)
+            return {}
+
+        return dict(payload)
+
+
+def _set_memory_pending_land_context(key: str, payload: Dict[str, Any]) -> None:
+    """Persist pending land context in process memory when Redis is unavailable."""
+    expires_at = time.time() + PENDING_LAND_CONTEXT_TTL_SECONDS
+    with _pending_land_context_lock:
+        cached = _pending_land_context_memory.get(key)
+        existing_payload = {}
+        if cached:
+            cached_expires_at, cached_payload = cached
+            if time.time() < cached_expires_at:
+                existing_payload = dict(cached_payload)
+            else:
+                _pending_land_context_memory.pop(key, None)
+        merged_payload = {
+            **existing_payload,
+            **{field: value for field, value in payload.items() if value is not None},
+        }
+        _pending_land_context_memory[key] = (expires_at, merged_payload)
+
+
+def _delete_memory_pending_land_context(key: str) -> None:
+    """Delete the in-memory pending-context fallback state."""
+    with _pending_land_context_lock:
+        _pending_land_context_memory.pop(key, None)
+
+
 def _cache_pending_land_context(user_id: str, survey_number: str, payload: Dict[str, Any]) -> None:
     """Merge partial document or boundary metadata into Redis."""
+    key = _pending_land_context_key(user_id, survey_number)
     redis_client = _get_pending_land_context_client()
+
     if redis_client is None:
+        _set_memory_pending_land_context(key, payload)
         return
 
-    key = _pending_land_context_key(user_id, survey_number)
-    existing_raw = redis_client.get(key)
-    existing_payload = json.loads(existing_raw) if existing_raw else {}
-    merged_payload = {
-        **existing_payload,
-        **{field: value for field, value in payload.items() if value is not None},
-    }
-    redis_client.setex(key, PENDING_LAND_CONTEXT_TTL_SECONDS, json.dumps(merged_payload))
+    try:
+        existing_payload = _load_pending_context_payload(redis_client.get(key))
+        merged_payload = {
+            **existing_payload,
+            **{field: value for field, value in payload.items() if value is not None},
+        }
+        redis_client.setex(key, PENDING_LAND_CONTEXT_TTL_SECONDS, json.dumps(merged_payload))
+        _delete_memory_pending_land_context(key)
+    except Exception as exc:
+        logger.warning(
+            "Falling back to in-memory pending land context cache for %s: %s",
+            key,
+            exc,
+        )
+        _set_memory_pending_land_context(key, payload)
 
 
 def _get_pending_land_context(user_id: str, survey_number: str) -> Dict[str, Any]:
     """Return cached document and boundary metadata for a survey number."""
+    key = _pending_land_context_key(user_id, survey_number)
     redis_client = _get_pending_land_context_client()
     if redis_client is None:
-        return {}
+        return _get_memory_pending_land_context(key)
 
-    cached = redis_client.get(_pending_land_context_key(user_id, survey_number))
-    return json.loads(cached) if cached else {}
+    try:
+        cached = redis_client.get(key)
+    except Exception as exc:
+        logger.warning(
+            "Falling back to in-memory pending land context lookup for %s: %s",
+            key,
+            exc,
+        )
+        return _get_memory_pending_land_context(key)
+
+    payload = _load_pending_context_payload(cached)
+    if payload:
+        return payload
+    return _get_memory_pending_land_context(key)
 
 
 def _clear_pending_land_context(user_id: str, survey_number: str) -> None:
     """Remove cached in-flight land registration state after success."""
+    key = _pending_land_context_key(user_id, survey_number)
+    _delete_memory_pending_land_context(key)
+
     redis_client = _get_pending_land_context_client()
     if redis_client is None:
         return
 
-    redis_client.delete(_pending_land_context_key(user_id, survey_number))
+    try:
+        redis_client.delete(key)
+    except Exception as exc:
+        logger.warning("Failed to clear pending land context %s from Redis: %s", key, exc)
 
 
 def _authenticated_storage_object_url(bucket: str, object_path: str) -> str:

@@ -743,7 +743,15 @@ def get_audit_result(
             "error": audit.get("error", "Unknown error"),
         }
 
-    return {"status": current_status}
+    logger.error(
+        "Audit %s has unsupported status '%s'; returning FAILED to preserve polling contract.",
+        audit_id,
+        current_status,
+    )
+    return {
+        "status": "FAILED",
+        "error": f"Unsupported audit status '{current_status}' encountered.",
+    }
 
 
 @router.get(

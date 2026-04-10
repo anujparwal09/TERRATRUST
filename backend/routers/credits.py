@@ -26,6 +26,58 @@ BALANCE_RATE_LIMIT = RateLimitSpec(
 )
 
 
+def _load_credit_history(user_id: str) -> tuple[list[CreditHistory], float]:
+    """Load audit history and derive a demo-safe balance fallback from minted records."""
+    history: list[CreditHistory] = []
+    minted_balance_ctt = 0.0
+
+    audits_resp = (
+        supabase_client.table("carbon_audits")
+        .select(
+            "audit_year, status, credits_issued, land_id, tx_hash, ipfs_metadata_cid, ipfs_url, minted_at"
+        )
+        .eq("user_id", user_id)
+        .order("audit_year", desc=True)
+        .execute()
+    )
+
+    for audit in audits_resp.data or []:
+        if audit.get("status") not in {"MINTED", "COMPLETE_NO_CREDITS"}:
+            continue
+
+        credits_issued = float(audit.get("credits_issued") or 0)
+        if audit.get("status") == "MINTED":
+            minted_balance_ctt += credits_issued
+
+        land_name = ""
+        try:
+            land_resp = (
+                supabase_client.table("land_parcels")
+                .select("farm_name")
+                .eq("id", audit["land_id"])
+                .single()
+                .execute()
+            )
+            land_name = land_resp.data.get("farm_name", "")
+        except Exception:
+            pass
+
+        history.append(
+            CreditHistory(
+                audit_year=audit.get("audit_year", 0),
+                credits_issued=credits_issued,
+                land_name=land_name,
+                tx_hash=audit.get("tx_hash"),
+                ipfs_certificate_url=to_gateway_url(
+                    audit.get("ipfs_metadata_cid") or audit.get("ipfs_url")
+                ),
+                minted_at=audit.get("minted_at"),
+            )
+        )
+
+    return history, round(minted_balance_ctt, 4)
+
+
 def _get_contract():
     """Lazily load and return the TerraTrust token contract instance."""
     alchemy_url = settings.ALCHEMY_POLYGON_AMOY_URL
@@ -62,70 +114,32 @@ def get_balance(
     enforce_rate_limit(current_user["id"], BALANCE_RATE_LIMIT)
 
     wallet_address = current_user.get("wallet_address")
-    if not wallet_address:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Wallet address has not been registered for this user yet.",
-        )
-
-    # --- On-chain balance ---------------------------------------------------
+    history: list[CreditHistory] = []
+    fallback_balance_ctt = 0.0
     try:
-        contract = _get_contract()
-        checksum = Web3.to_checksum_address(wallet_address)
-        balance = contract.functions.balanceOf(checksum, CARBON_CREDIT_TOKEN_ID).call()
-        balance_ctt = float(balance) / 10
-    except Exception as exc:
-        logger.error("balanceOf call failed for %s: %s", wallet_address, exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Blockchain balance is temporarily unavailable.",
-        ) from exc
-
-    # --- Audit history from Supabase ----------------------------------------
-    history = []
-    try:
-        audits_resp = (
-            supabase_client.table("carbon_audits")
-            .select(
-                "audit_year, status, credits_issued, land_id, tx_hash, ipfs_metadata_cid, ipfs_url, minted_at"
-            )
-            .eq("user_id", current_user["id"])
-            .order("audit_year", desc=True)
-            .execute()
-        )
-
-        for audit in audits_resp.data or []:
-            if audit.get("status") not in {"MINTED", "COMPLETE_NO_CREDITS"}:
-                continue
-
-            credits_issued = float(audit.get("credits_issued") or 0)
-            land_name = ""
-            try:
-                land_resp = (
-                    supabase_client.table("land_parcels")
-                    .select("farm_name")
-                    .eq("id", audit["land_id"])
-                    .single()
-                    .execute()
-                )
-                land_name = land_resp.data.get("farm_name", "")
-            except Exception:
-                pass
-
-            history.append(
-                CreditHistory(
-                    audit_year=audit.get("audit_year", 0),
-                    credits_issued=credits_issued,
-                    land_name=land_name,
-                    tx_hash=audit.get("tx_hash"),
-                    ipfs_certificate_url=to_gateway_url(
-                        audit.get("ipfs_metadata_cid") or audit.get("ipfs_url")
-                    ),
-                    minted_at=audit.get("minted_at"),
-                )
-            )
+        history, fallback_balance_ctt = _load_credit_history(current_user["id"])
     except Exception as exc:
         logger.error("Failed to fetch audit history: %s", exc)
+
+    balance_ctt = fallback_balance_ctt
+    if not wallet_address:
+        logger.info(
+            "User %s has no registered wallet yet; returning history-derived zero balance.",
+            current_user["id"],
+        )
+    else:
+        try:
+            contract = _get_contract()
+            checksum = Web3.to_checksum_address(wallet_address)
+            balance = contract.functions.balanceOf(checksum, CARBON_CREDIT_TOKEN_ID).call()
+            balance_ctt = float(balance) / 10
+        except Exception as exc:
+            logger.warning(
+                "balanceOf call failed for %s; using history-derived fallback balance %.4f CTT: %s",
+                wallet_address,
+                fallback_balance_ctt,
+                exc,
+            )
 
     total = len(history)
     start_index = (page - 1) * limit
