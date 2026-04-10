@@ -11,7 +11,6 @@ class CreditHistory(BaseModel):
 
     audit_year: int
     credits_issued: float
-    minted_credit_amount: Optional[int] = None
     land_name: str
     tx_hash: Optional[str] = None
     ipfs_certificate_url: Optional[str] = None

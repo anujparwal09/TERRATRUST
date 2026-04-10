@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -18,7 +19,9 @@ logger = logging.getLogger("terratrust.minting")
 # ---------------------------------------------------------------------------
 # Contract ABI paths
 # ---------------------------------------------------------------------------
-ABI_FILENAMES = (
+CONTRACT_ARTIFACT_RELATIVE_PATHS = (
+    os.path.join("contracts", "TerraToken.sol", "TerraTrustToken.json"),
+    os.path.join("contracts", "TerraToken.sol", "TerraToken.json"),
     "TerraTrustToken_ABI.json",
     "TerraToken_ABI.json",
 )
@@ -31,24 +34,69 @@ def _coerce_credit_amount(credit_amount: float) -> int:
     except (TypeError, ValueError) as exc:
         raise ValueError("credit_amount must be numeric.") from exc
 
-    coerced_amount = max(0, int(round(precise_amount)))
+    # The ERC-1155 contract mints whole-token units only. Truncate rather than
+    # round so on-chain issuance never exceeds the verified CO2e quantity.
+    coerced_amount = max(0, int(math.floor(precise_amount + 1e-9)))
     if abs(precise_amount - coerced_amount) > 1e-9:
         logger.warning(
-            "Coercing calculated credits %.4f to %d whole CTT for ERC-1155 minting.",
+            "Truncating calculated credits %.4f to %d whole CTT for ERC-1155 minting.",
             precise_amount,
             coerced_amount,
         )
     return coerced_amount
 
 
-def _resolve_abi_path() -> str:
-    """Return the first available ABI path for the deployed token contract."""
+def _derive_measurement_date(
+    tree_scans: List[Dict[str, Any]],
+    fallback_timestamp: Any = None,
+) -> str:
+    """Return the documented measurement date from scan timestamps when available."""
+    candidates: List[datetime] = []
+
+    def _coerce_timestamp(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                return None
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            try:
+                parsed = datetime.fromisoformat(candidate)
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+        return None
+
+    for scan in tree_scans:
+        parsed_timestamp = _coerce_timestamp(scan.get("scan_timestamp"))
+        if parsed_timestamp is not None:
+            candidates.append(parsed_timestamp.astimezone(timezone.utc))
+
+    if candidates:
+        return max(candidates).date().isoformat()
+
+    parsed_fallback = _coerce_timestamp(fallback_timestamp)
+    if parsed_fallback is not None:
+        return parsed_fallback.astimezone(timezone.utc).date().isoformat()
+
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _resolve_artifact_path() -> str:
+    """Return the first available contract artifact path for the deployed token contract."""
     artifacts_dir = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
         "contracts",
         "artifacts",
     )
-    candidate_paths = [os.path.join(artifacts_dir, filename) for filename in ABI_FILENAMES]
+    candidate_paths = [
+        os.path.join(artifacts_dir, relative_path)
+        for relative_path in CONTRACT_ARTIFACT_RELATIVE_PATHS
+    ]
 
     for candidate in candidate_paths:
         if os.path.exists(candidate):
@@ -60,11 +108,18 @@ def _resolve_abi_path() -> str:
     )
 
 
-def _load_abi() -> list:
-    """Load the TerraTrust token ABI from the artifacts directory."""
-    abi_path = _resolve_abi_path()
-    with open(abi_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_contract_abi() -> list[dict[str, Any]]:
+    """Load the TerraTrust token ABI from the Hardhat artifact tree."""
+    artifact_path = _resolve_artifact_path()
+    with open(artifact_path, "r", encoding="utf-8") as file_handle:
+        artifact = json.load(file_handle)
+
+    if isinstance(artifact, dict) and isinstance(artifact.get("abi"), list):
+        return artifact["abi"]
+    if isinstance(artifact, list):
+        return artifact
+
+    raise ValueError(f"Contract artifact '{artifact_path}' does not contain a valid ABI.")
 
 
 def _require_setting(name: str, value: str) -> str:
@@ -139,7 +194,10 @@ def build_audit_metadata(
         "village": audit_data.get("village"),
         "land_boundary_hash": boundary_hash,
         "audit_year": audit_data.get("audit_year"),
-        "measurement_date": datetime.now(timezone.utc).date().isoformat(),
+        "measurement_date": _derive_measurement_date(
+            tree_scans,
+            audit_data.get("calculated_at") or audit_data.get("created_at"),
+        ),
         "total_biomass_tonnes": credit_result.get("current_biomass", 0),
         "prev_biomass_tonnes": credit_result.get("prev_year_biomass", 0),
         "delta_biomass": credit_result.get("delta_biomass", 0),
@@ -235,7 +293,7 @@ async def mint_carbon_credits(
     w3, admin_account = _get_polygon_client()
 
     # 3. Prepare contract
-    abi = _load_abi()
+    abi = load_contract_abi()
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(settings.CONTRACT_ADDRESS),
         abi=abi,

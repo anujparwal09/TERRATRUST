@@ -1,8 +1,6 @@
 """Credits router for balance and history lookup through authenticated user context."""
 
-import json
 import logging
-import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from web3 import Web3
@@ -12,28 +10,13 @@ from app.database import supabase_client
 from app.dependencies import get_current_user
 from models.blockchain import BalanceResponse, CreditHistory
 from services.ipfs_service import to_gateway_url
+from services.minting_service import load_contract_abi
 
 logger = logging.getLogger("terratrust.credits")
 
 router = APIRouter()
 
-# ---------------------------------------------------------------------------
-# Contract ABI
-# ---------------------------------------------------------------------------
-ABI_FILENAMES = (
-    "TerraTrustToken_ABI.json",
-    "TerraToken_ABI.json",
-)
-
 CARBON_CREDIT_TOKEN_ID = 1  # ERC-1155 token id for fungible credits
-
-
-def _derive_minted_credit_amount(credits_issued: object) -> int:
-    """Mirror the whole-token conversion used by the minting service."""
-    try:
-        return max(0, int(round(float(credits_issued or 0))))
-    except (TypeError, ValueError):
-        return 0
 
 
 def _get_contract():
@@ -48,27 +31,9 @@ def _get_contract():
     if not w3.is_connected():
         raise ConnectionError("Cannot connect to Polygon RPC.")
 
-    artifacts_dir = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),
-        "contracts",
-        "artifacts",
-    )
-    candidate_paths = [
-        os.path.join(artifacts_dir, filename)
-        for filename in ABI_FILENAMES
-    ]
-    abi_path = next((path for path in candidate_paths if os.path.exists(path)), candidate_paths[0])
-
-    if not os.path.exists(abi_path):
-        raise FileNotFoundError(
-            f"Contract ABI not found. Expected one of: {', '.join(candidate_paths)}"
-        )
-    with open(abi_path, "r", encoding="utf-8") as f:
-        abi = json.load(f)
-
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(settings.CONTRACT_ADDRESS),
-        abi=abi,
+        abi=load_contract_abi(),
     )
     return contract
 
@@ -77,7 +42,7 @@ def _get_contract():
 # GET /balance
 # ---------------------------------------------------------------------------
 @router.get("/balance", response_model=BalanceResponse)
-async def get_balance(
+def get_balance(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
@@ -113,15 +78,17 @@ async def get_balance(
         audits_resp = (
             supabase_client.table("carbon_audits")
             .select(
-                "audit_year, credits_issued, land_id, tx_hash, ipfs_metadata_cid, ipfs_url, minted_at"
+                "audit_year, status, credits_issued, land_id, tx_hash, ipfs_metadata_cid, ipfs_url, minted_at"
             )
             .eq("user_id", current_user["id"])
-            .eq("status", "MINTED")
             .order("audit_year", desc=True)
             .execute()
         )
 
         for audit in audits_resp.data or []:
+            if audit.get("status") not in {"MINTED", "COMPLETE_NO_CREDITS"}:
+                continue
+
             credits_issued = float(audit.get("credits_issued") or 0)
             land_name = ""
             try:
@@ -140,7 +107,6 @@ async def get_balance(
                 CreditHistory(
                     audit_year=audit.get("audit_year", 0),
                     credits_issued=credits_issued,
-                    minted_credit_amount=_derive_minted_credit_amount(credits_issued),
                     land_name=land_name,
                     tx_hash=audit.get("tx_hash"),
                     ipfs_certificate_url=to_gateway_url(

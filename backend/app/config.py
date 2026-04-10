@@ -1,8 +1,14 @@
 """Application configuration and environment loading."""
 
+import re
 from typing import Literal, Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+EVM_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+HEX_PRIVATE_KEY_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
+HEX_PRIVATE_KEY_WITH_OPTIONAL_PREFIX_RE = re.compile(r"^(?:0x)?[a-fA-F0-9]{64}$")
 
 
 class Settings(BaseSettings):
@@ -55,6 +61,37 @@ class Settings(BaseSettings):
     WEB_CORS_ORIGINS: str = ""
     MAINTENANCE_MODE: bool = False
     MAINTENANCE_MESSAGE: Optional[str] = None
+
+    @field_validator("ADMIN_WALLET_ADDRESS", "CONTRACT_ADDRESS")
+    @classmethod
+    def _validate_evm_address(cls, value: str) -> str:
+        candidate = value.strip()
+        if not candidate:
+            return ""
+        if not EVM_ADDRESS_RE.fullmatch(candidate):
+            raise ValueError("must be a valid 0x-prefixed EVM address")
+        return candidate
+
+    @field_validator("ADMIN_WALLET_PRIVATE_KEY")
+    @classmethod
+    def _validate_private_key(cls, value: str) -> str:
+        candidate = value.strip()
+        if not candidate:
+            return ""
+
+        normalised = candidate if candidate.startswith("0x") else f"0x{candidate}"
+        if not HEX_PRIVATE_KEY_WITH_OPTIONAL_PREFIX_RE.fullmatch(candidate) or not HEX_PRIVATE_KEY_RE.fullmatch(normalised):
+            raise ValueError("must be a valid 0x-prefixed 32-byte hex private key")
+        return normalised
+
+    @field_validator("PINATA_GATEWAY_URL")
+    @classmethod
+    def _normalise_pinata_gateway(cls, value: str) -> str:
+        candidate = value.strip()
+        if not candidate:
+            return ""
+        candidate = candidate.removeprefix("https://").removeprefix("http://")
+        return candidate.rstrip("/")
 
 
 # Singleton — import ``settings`` from anywhere in the app.

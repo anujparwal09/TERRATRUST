@@ -124,6 +124,11 @@ def test_distribute_zone_counts_spreads_remainder_across_bands():
         "medium_density": 2,
         "high_density": 1,
     }
+    assert zone_generation_service._distribute_zone_counts(5) == {
+        "low_density": 1,
+        "medium_density": 2,
+        "high_density": 2,
+    }
     assert zone_generation_service._distribute_zone_counts(6) == {
         "low_density": 2,
         "medium_density": 2,

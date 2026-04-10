@@ -1,16 +1,30 @@
 """NISAR service for ASF granule search and download."""
 
+from __future__ import annotations
+
 import logging
 import os
 import tempfile
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-import asf_search as asf
+try:
+    import asf_search as asf
+except ImportError:  # pragma: no cover - depends on optional local install
+    asf = None
 
 from app.config import settings
 
 logger = logging.getLogger("terratrust.nisar")
+
+
+def _require_asf_search() -> Any:
+    """Return the ASF client module or fail only when NISAR support is used."""
+    if asf is None:
+        raise RuntimeError(
+            "asf_search is not installed. Install backend requirements to enable NISAR support."
+        )
+    return asf
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +47,8 @@ def _get_earthdata_session() -> asf.ASFSession:
             "Set NASA_EARTHDATA_USERNAME and NASA_EARTHDATA_PASSWORD in .env"
         )
 
-    session = asf.ASFSession()
+    asf_module = _require_asf_search()
+    session = asf_module.ASFSession()
     session.auth_with_creds(username, password)
     logger.info("Authenticated with NASA Earthdata as '%s'.", username)
     return session
@@ -93,11 +108,12 @@ def search_nisar_granules(
     )
 
     # ASF search — NISAR uses platform "NISAR"
-    results: List[asf.ASFProduct] = []
+    asf_module = _require_asf_search()
+    results: List[Any] = []
 
     try:
-        nisar_results = asf.search(
-            platform=[asf.PLATFORM.NISAR],
+        nisar_results = asf_module.search(
+            platform=[asf_module.PLATFORM.NISAR],
             intersectsWith=wkt,
             start=start_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
             end=end_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -166,7 +182,8 @@ def download_nisar_scene(
 
     try:
         # asf_search download helper
-        asf.download_url(
+        asf_module = _require_asf_search()
+        asf_module.download_url(
             url=download_url,
             path=output_dir,
             session=session,

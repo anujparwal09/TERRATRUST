@@ -26,45 +26,24 @@ describe("TerraTrustToken", function () {
     const { token, farmer } = await deployFixture();
     const auditId = 1001n;
 
-    await expect(
-      token["mintAudit(address,uint256,uint256,string,string,uint256)"](
-        farmer.address,
-        auditId,
-        12,
-        "ipfs://cid-123",
-        "land-1",
-        2026
-      )
-    )
-      .to.emit(token, "AuditMinted")
-      .withArgs(farmer.address, auditId, 12, "ipfs://cid-123", anyValue);
+    await token.mintAudit(
+      farmer.address,
+      auditId,
+      12,
+      "ipfs://cid-123",
+      "land-1",
+      2026
+    );
 
     expect(await token.balanceOf(farmer.address, 1)).to.equal(12n);
     expect(await token.balanceOf(farmer.address, auditId)).to.equal(1n);
     expect(await token.getAuditEvidence(auditId)).to.equal("ipfs://cid-123");
   });
 
-  it("supports the legacy mint parameter order for backward compatibility", async function () {
-    const { token, farmer } = await deployFixture();
-    const auditId = 1002n;
-
-    await token["mintAudit(address,uint256,uint256,string,uint256,string)"](
-      farmer.address,
-      auditId,
-      5,
-      "land-legacy",
-      2026,
-      "ipfs://legacy-cid"
-    );
-
-    expect(await token.balanceOf(farmer.address, 1)).to.equal(5n);
-    expect(await token.getAuditEvidence(auditId)).to.equal("ipfs://legacy-cid");
-  });
-
   it("prevents double minting for the same land and audit year", async function () {
     const { token, farmer } = await deployFixture();
 
-    await token["mintAudit(address,uint256,uint256,string,string,uint256)"](
+    await token.mintAudit(
       farmer.address,
       1001,
       4,
@@ -74,7 +53,7 @@ describe("TerraTrustToken", function () {
     );
 
     await expect(
-      token["mintAudit(address,uint256,uint256,string,string,uint256)"](
+      token.mintAudit(
         farmer.address,
         1002,
         7,
@@ -88,7 +67,7 @@ describe("TerraTrustToken", function () {
   it("retires credits and records the reason", async function () {
     const { token, farmer } = await deployFixture();
 
-    await token["mintAudit(address,uint256,uint256,string,string,uint256)"](
+    await token.mintAudit(
       farmer.address,
       1001,
       10,
@@ -111,7 +90,7 @@ describe("TerraTrustToken", function () {
     const { token, farmer } = await deployFixture();
 
     await expect(
-      token.connect(farmer)["mintAudit(address,uint256,uint256,string,string,uint256)"](
+      token.connect(farmer).mintAudit(
         farmer.address,
         1001,
         1,

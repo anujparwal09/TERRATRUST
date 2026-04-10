@@ -575,7 +575,13 @@ async def fetch_boundary_layer1(
         features = data.get("features", [])
         if features and features[0].get("geometry"):
             logger.info("Layer 1 (WMS) boundary found for gis_code=%s", gis_code)
-            return features[0]["geometry"]
+            return {
+                "geojson": features[0]["geometry"],
+                "lgd_district_code": str(lgd_codes["dist_code"]),
+                "lgd_taluka_code": str(lgd_codes["taluka_code"]),
+                "lgd_village_code": str(lgd_codes["village_code"]),
+                "gis_code": gis_code,
+            }
 
         logger.info("Layer 1 (WMS) returned no features for gis_code=%s", gis_code)
         return None
@@ -649,7 +655,7 @@ async def fetch_boundary_layer2(
                         survey_number,
                         state,
                     )
-                    return geometry
+                    return {"geojson": geometry}
             finally:
                 await context.close()
                 await browser.close()
@@ -685,11 +691,12 @@ def _safe_satellite_thumbnail_url(geojson: Dict[str, Any]) -> Optional[str]:
 
 def _build_boundary_success_response(
     boundary_source: str,
-    geojson: Dict[str, Any],
+    boundary_payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Return a boundary response compatible with both documented field names."""
+    geojson = boundary_payload["geojson"]
     satellite_url = _safe_satellite_thumbnail_url(geojson)
-    return {
+    response = {
         "status": "success",
         "boundary_source": boundary_source,
         "satellite_png_url": satellite_url,
@@ -697,6 +704,19 @@ def _build_boundary_success_response(
         "geojson": geojson,
         "area_hectares": _estimate_area_hectares(geojson),
     }
+    response.update(
+        {
+            field: boundary_payload.get(field)
+            for field in (
+                "lgd_district_code",
+                "lgd_taluka_code",
+                "lgd_village_code",
+                "gis_code",
+            )
+            if boundary_payload.get(field) is not None
+        }
+    )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -723,18 +743,18 @@ async def fetch_land_boundary(
         ``{status: "manual_required"}``
     """
     # Layer 1 — BhuNaksha WMS
-    geojson = await fetch_boundary_layer1(
+    boundary_payload = await fetch_boundary_layer1(
         survey_number, district, taluka, village, state, user_lat, user_lng
     )
-    if geojson:
-        return _build_boundary_success_response("WMS_AUTO", geojson)
+    if boundary_payload:
+        return _build_boundary_success_response("WMS_AUTO", boundary_payload)
 
     # Layer 2 — Playwright scraping
-    geojson = await fetch_boundary_layer2(
+    boundary_payload = await fetch_boundary_layer2(
         survey_number, district, taluka, village, state, user_lat, user_lng
     )
-    if geojson:
-        return _build_boundary_success_response("SCRAPE", geojson)
+    if boundary_payload:
+        return _build_boundary_success_response("SCRAPE", boundary_payload)
 
     # All layers exhausted
     logger.warning(

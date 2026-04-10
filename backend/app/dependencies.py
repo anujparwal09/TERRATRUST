@@ -94,7 +94,7 @@ def _provision_user(firebase_uid: str, phone_number: str) -> Dict[str, Any]:
     raise RuntimeError("Failed to provision backend user profile.")
 
 
-async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
+def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
     """Verify a Firebase ID token and return the provisioned backend user row."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(

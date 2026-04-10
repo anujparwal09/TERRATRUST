@@ -19,7 +19,12 @@ class TreeSample(BaseModel):
     zone_id: str
     species: str
     species_confidence: float = Field(..., ge=0.0, le=1.0)
-    dbh_cm: float = Field(..., gt=0, description="Diameter at breast height in cm")
+    dbh_cm: float = Field(
+        ...,
+        gt=0,
+        lt=500,
+        description="Diameter at breast height in cm",
+    )
     height_m: Optional[float] = Field(None, gt=0, description="Height in metres (optional)")
     gps: GPSPoint
     gps_accuracy_m: float = Field(..., ge=0, description="Horizontal GPS accuracy in metres")

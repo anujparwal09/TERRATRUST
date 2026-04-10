@@ -7,12 +7,12 @@ create extension if not exists "uuid-ossp";
 create table if not exists users (
     id uuid primary key default uuid_generate_v4(),
     firebase_uid varchar(128) unique not null,
-    phone_number varchar(20) unique not null,
+    phone_number varchar(15) unique not null,
     full_name varchar(255),
-    aadhaar_hash varchar(255),
+    aadhaar_hash varchar(64),
     kyc_completed boolean default false,
     wallet_address varchar(42) unique,
-    role varchar(20) default 'farmer',
+    role varchar(20) default 'FARMER',
     created_at timestamptz default now(),
     updated_at timestamptz default now()
 );
@@ -32,7 +32,7 @@ create table if not exists wallet_recovery_requests (
 create table if not exists land_parcels (
     id uuid primary key default uuid_generate_v4(),
     user_id uuid not null references users(id) on delete cascade,
-    survey_number varchar(100) not null,
+    survey_number varchar(50) not null,
     farm_name varchar(255),
     district varchar(100) not null,
     taluka varchar(100) not null,
@@ -41,9 +41,9 @@ create table if not exists land_parcels (
     geom geometry(multipolygon, 4326) not null,
     area_hectares decimal(10, 4),
     is_verified boolean default false,
-    boundary_source varchar(20),
+    boundary_source varchar(50),
     ocr_owner_name varchar(255),
-    doc_image_url text,
+    doc_image_url varchar(500),
     lgd_district_code varchar(20),
     lgd_taluka_code varchar(20),
     lgd_village_code varchar(20),
@@ -138,6 +138,7 @@ alter table if exists ar_tree_scans add column if not exists scan_timestamp time
 create or replace function update_land_area()
 returns trigger as $$
 begin
+    new.updated_at := now();
     new.area_hectares := st_area(new.geom::geography) / 10000.0;
     return new;
 end;
@@ -151,6 +152,7 @@ execute function update_land_area();
 
 create index if not exists idx_users_firebase_uid on users(firebase_uid);
 create index if not exists idx_users_phone on users(phone_number);
+create index if not exists idx_users_wallet on users(wallet_address);
 create index if not exists idx_wallet_recovery_user on wallet_recovery_requests(user_id);
 create index if not exists idx_wallet_recovery_status on wallet_recovery_requests(status);
 create index if not exists idx_land_parcels_user on land_parcels(user_id);
@@ -167,143 +169,3 @@ create index if not exists idx_ar_tree_scans_audit on ar_tree_scans(audit_id);
 create index if not exists idx_ar_tree_scans_land on ar_tree_scans(land_id);
 create index if not exists idx_ar_tree_scans_zone on ar_tree_scans(zone_id);
 create index if not exists idx_ar_tree_scans_gps on ar_tree_scans using gist(gps_location);
-
-alter table users enable row level security;
-alter table wallet_recovery_requests enable row level security;
-alter table land_parcels enable row level security;
-alter table carbon_audits enable row level security;
-alter table sampling_zones enable row level security;
-alter table ar_tree_scans enable row level security;
-
-do $$
-begin
-    if not exists (
-        select 1 from pg_policies
-        where schemaname = 'public'
-          and tablename = 'users'
-          and policyname = 'Users can view own profile'
-    ) then
-        create policy "Users can view own profile" on users
-            for select using (auth.uid() = id);
-    end if;
-end
-$$;
-
-do $$
-begin
-    if not exists (
-        select 1 from pg_policies
-        where schemaname = 'public'
-          and tablename = 'wallet_recovery_requests'
-          and policyname = 'Users can view own wallet recovery requests'
-    ) then
-        create policy "Users can view own wallet recovery requests" on wallet_recovery_requests
-            for select using (auth.uid() = user_id);
-    end if;
-end
-$$;
-
-do $$
-begin
-    if not exists (
-        select 1 from pg_policies
-        where schemaname = 'public'
-          and tablename = 'wallet_recovery_requests'
-          and policyname = 'Users can create own wallet recovery requests'
-    ) then
-        create policy "Users can create own wallet recovery requests" on wallet_recovery_requests
-            for insert with check (auth.uid() = user_id);
-    end if;
-end
-$$;
-
-do $$
-begin
-    if not exists (
-        select 1 from pg_policies
-        where schemaname = 'public'
-          and tablename = 'users'
-          and policyname = 'Users can update own profile'
-    ) then
-        create policy "Users can update own profile" on users
-            for update using (auth.uid() = id);
-    end if;
-end
-$$;
-
-do $$
-begin
-    if not exists (
-        select 1 from pg_policies
-        where schemaname = 'public'
-          and tablename = 'land_parcels'
-          and policyname = 'Users can manage own lands'
-    ) then
-        create policy "Users can manage own lands" on land_parcels
-            for all using (auth.uid() = user_id);
-    end if;
-end
-$$;
-
-do $$
-begin
-    if not exists (
-        select 1 from pg_policies
-        where schemaname = 'public'
-          and tablename = 'carbon_audits'
-          and policyname = 'Users can view own audits'
-    ) then
-        create policy "Users can view own audits" on carbon_audits
-            for select using (
-                exists (
-                    select 1
-                    from land_parcels
-                    where land_parcels.id = carbon_audits.land_id
-                      and land_parcels.user_id = auth.uid()
-                )
-            );
-    end if;
-end
-$$;
-
-do $$
-begin
-    if not exists (
-        select 1 from pg_policies
-        where schemaname = 'public'
-          and tablename = 'sampling_zones'
-          and policyname = 'Users can view zones for own lands'
-    ) then
-        create policy "Users can view zones for own lands" on sampling_zones
-            for select using (
-                exists (
-                    select 1
-                    from land_parcels
-                    where land_parcels.id = sampling_zones.land_id
-                      and land_parcels.user_id = auth.uid()
-                )
-            );
-    end if;
-end
-$$;
-
-do $$
-begin
-    if not exists (
-        select 1 from pg_policies
-        where schemaname = 'public'
-          and tablename = 'ar_tree_scans'
-          and policyname = 'Users can view tree scans for own lands'
-    ) then
-        create policy "Users can view tree scans for own lands" on ar_tree_scans
-            for select using (
-                exists (
-                    select 1
-                    from land_parcels
-                    where land_parcels.id = ar_tree_scans.land_id
-                      and land_parcels.user_id = auth.uid()
-                )
-            );
-    end if;
-end
-$$;

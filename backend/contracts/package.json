@@ -2,7 +2,7 @@
   "name": "contracts",
   "version": "1.0.0",
   "engines": {
-    "node": ">=18 <=20"
+    "node": ">=22.11 <23"
   },
   "main": "hardhat.config.js",
   "scripts": {

@@ -2,14 +2,19 @@
 
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+import json
 import logging
 from pathlib import Path
+from redis import Redis
 import unicodedata
 import uuid
 from typing import Any, Dict, List
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from starlette.concurrency import run_in_threadpool
 
+from app.config import settings
 from app.database import (
     analyse_boundary_geojson,
     insert_land_parcel_record,
@@ -36,6 +41,11 @@ router = APIRouter()
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
 ALLOWED_DOCUMENT_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png"}
 ALLOWED_DOCUMENT_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+PENDING_LAND_CONTEXT_TTL_SECONDS = 24 * 60 * 60
+OWNER_NAME_MATCH_THRESHOLD = 0.80
+
+_pending_land_context_client: Redis | None = None
+_pending_land_context_initialised = False
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +61,101 @@ def _normalise_name(name: str) -> str:
 def _name_similarity(left: str, right: str) -> float:
     """Return a fuzzy similarity ratio for owner-name matching."""
     return SequenceMatcher(None, _normalise_name(left), _normalise_name(right)).ratio()
+
+
+def _ensure_kyc_completed(current_user: Dict[str, Any]) -> None:
+    """Enforce the documented KYC prerequisite for land registration flows."""
+    if current_user.get("kyc_completed") and current_user.get("full_name"):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="KYC must be completed before registering land.",
+    )
+
+
+def _ensure_owner_name_matches_kyc(owner_name: str, current_user: Dict[str, Any]) -> None:
+    """Reject land-document owners that do not match the authenticated KYC profile."""
+    _ensure_kyc_completed(current_user)
+
+    similarity = _name_similarity(owner_name, current_user.get("full_name") or "")
+    if similarity < OWNER_NAME_MATCH_THRESHOLD:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Owner name on document does not match your registered name.",
+        )
+
+
+def _get_pending_land_context_client() -> Redis | None:
+    """Return the Redis client used to bridge document and boundary state."""
+    global _pending_land_context_client, _pending_land_context_initialised
+
+    if _pending_land_context_initialised:
+        return _pending_land_context_client
+
+    _pending_land_context_initialised = True
+    try:
+        _pending_land_context_client = Redis.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        _pending_land_context_client.ping()
+    except Exception as exc:
+        logger.warning("Redis unavailable for pending land context caching: %s", exc)
+        _pending_land_context_client = None
+
+    return _pending_land_context_client
+
+
+def _pending_land_context_key(user_id: str, survey_number: str) -> str:
+    """Build the Redis key used for a user's in-flight land registration."""
+    return f"pending-land-context:{user_id}:{survey_number.strip().lower()}"
+
+
+def _cache_pending_land_context(user_id: str, survey_number: str, payload: Dict[str, Any]) -> None:
+    """Merge partial document or boundary metadata into Redis."""
+    redis_client = _get_pending_land_context_client()
+    if redis_client is None:
+        return
+
+    key = _pending_land_context_key(user_id, survey_number)
+    existing_raw = redis_client.get(key)
+    existing_payload = json.loads(existing_raw) if existing_raw else {}
+    merged_payload = {
+        **existing_payload,
+        **{field: value for field, value in payload.items() if value is not None},
+    }
+    redis_client.setex(key, PENDING_LAND_CONTEXT_TTL_SECONDS, json.dumps(merged_payload))
+
+
+def _get_pending_land_context(user_id: str, survey_number: str) -> Dict[str, Any]:
+    """Return cached document and boundary metadata for a survey number."""
+    redis_client = _get_pending_land_context_client()
+    if redis_client is None:
+        return {}
+
+    cached = redis_client.get(_pending_land_context_key(user_id, survey_number))
+    return json.loads(cached) if cached else {}
+
+
+def _clear_pending_land_context(user_id: str, survey_number: str) -> None:
+    """Remove cached in-flight land registration state after success."""
+    redis_client = _get_pending_land_context_client()
+    if redis_client is None:
+        return
+
+    redis_client.delete(_pending_land_context_key(user_id, survey_number))
+
+
+def _authenticated_storage_object_url(bucket: str, object_path: str) -> str:
+    """Return the canonical authenticated URL for a private Supabase object."""
+    encoded_path = quote(object_path, safe="/")
+    return (
+        f"{settings.SUPABASE_URL.rstrip('/')}"
+        f"/storage/v1/object/authenticated/{bucket}/{encoded_path}"
+    )
 
 
 def _validate_document_upload(file: UploadFile, image_bytes: bytes) -> None:
@@ -90,9 +195,11 @@ def _validate_document_upload(file: UploadFile, image_bytes: bytes) -> None:
 )
 async def verify_document(
     image: UploadFile | None = File(None, description="Scanned land document image"),
-    _current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Extract structured fields from a scanned land document using OCR."""
+    _ensure_kyc_completed(current_user)
+
     if image is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -102,7 +209,39 @@ async def verify_document(
     try:
         image_bytes = await image.read()
         _validate_document_upload(image, image_bytes)
-        fields = ocr_service.extract_fields_from_document(image_bytes)
+        fields = await run_in_threadpool(ocr_service.extract_fields_from_document, image_bytes)
+        _ensure_owner_name_matches_kyc(fields["owner_name"], current_user)
+
+        document_extension = Path(image.filename or "").suffix.lower() or ".jpg"
+        if document_extension not in ALLOWED_DOCUMENT_EXTENSIONS:
+            document_extension = ".jpg"
+
+        document_storage_path = (
+            f"{current_user['id']}/pending/{uuid.uuid4()}{document_extension}"
+        )
+        await run_in_threadpool(
+            lambda: supabase_client.storage.from_("land-documents").upload(
+                document_storage_path,
+                image_bytes,
+            )
+        )
+
+        _cache_pending_land_context(
+            current_user["id"],
+            fields["survey_number"],
+            {
+                "doc_image_url": _authenticated_storage_object_url(
+                    "land-documents",
+                    document_storage_path,
+                ),
+                "owner_name": fields.get("owner_name"),
+                "village": fields.get("village"),
+                "taluka": fields.get("taluka"),
+                "district": fields.get("district"),
+                "state": fields.get("state", "Maharashtra"),
+            },
+        )
+
         return DocumentUploadResponse(
             survey_number=fields["survey_number"],
             owner_name=fields["owner_name"],
@@ -112,6 +251,8 @@ async def verify_document(
             state=fields.get("state", "Maharashtra"),
             extraction_confidence=fields["extraction_confidence"],
         )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -137,9 +278,11 @@ async def fetch_boundary(
     state: str = Query(...),
     user_lat: float = Query(...),
     user_lng: float = Query(...),
-    _current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Attempt to auto-fetch the land boundary from government GIS layers."""
+    _ensure_kyc_completed(current_user)
+
     result = await land_boundary_service.fetch_land_boundary(
         survey_number=survey_number,
         district=district,
@@ -149,6 +292,20 @@ async def fetch_boundary(
         user_lat=user_lat,
         user_lng=user_lng,
     )
+
+    if result.get("status") == "success":
+        _cache_pending_land_context(
+            current_user["id"],
+            survey_number,
+            {
+                "boundary_source": result.get("boundary_source"),
+                "lgd_district_code": result.get("lgd_district_code"),
+                "lgd_taluka_code": result.get("lgd_taluka_code"),
+                "lgd_village_code": result.get("lgd_village_code"),
+                "gis_code": result.get("gis_code"),
+            },
+        )
+
     return BoundaryFetchResponse(**result)
 
 
@@ -174,22 +331,7 @@ async def register_land(
     """
 
     # --- 1. Cross-check owner name with KYC name --------------------------
-    kyc_name = current_user.get("full_name") or ""
-
-    if not kyc_name:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="KYC must be completed before registering land.",
-        )
-
-    similarity = _name_similarity(body.ocr_owner_name, kyc_name)
-    if similarity < 0.80:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Owner name on document does not match your registered name."
-            ),
-        )
+    _ensure_owner_name_matches_kyc(body.ocr_owner_name, current_user)
 
     # --- 2. Validate GeoJSON in PostGIS ------------------------------------
     try:
@@ -214,12 +356,14 @@ async def register_land(
         )
 
     # --- 3. Duplicate check ------------------------------------------------
-    dup_check = (
-        supabase_client.table("land_parcels")
-        .select("id")
-        .eq("user_id", current_user["id"])
-        .eq("survey_number", body.survey_number)
-        .execute()
+    dup_check = await run_in_threadpool(
+        lambda: (
+            supabase_client.table("land_parcels")
+            .select("id")
+            .eq("user_id", current_user["id"])
+            .eq("survey_number", body.survey_number)
+            .execute()
+        )
     )
     if dup_check.data:
         raise HTTPException(
@@ -227,15 +371,17 @@ async def register_land(
             detail="This survey number is already registered under your account.",
         )
 
-    # --- 4. Validate area in hectares --------------------------------------
     area_hectares = round(float(boundary_analysis.get("area_hectares") or 0), 4)
+
     if area_hectares < 0.1 or area_hectares > 100:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Land area must be between 0.1 and 100 hectares.",
         )
 
-    # --- 5. Insert into Supabase -------------------------------------------
+    pending_context = _get_pending_land_context(current_user["id"], body.survey_number)
+
+    # --- 4. Insert into Supabase -------------------------------------------
     land_id = str(uuid.uuid4())
     insert_data: Dict[str, Any] = {
         "id": land_id,
@@ -251,6 +397,11 @@ async def register_land(
         "boundary_geojson": boundary_analysis.get("normalized_geojson") or body.geojson,
         "area_hectares": area_hectares,
         "is_verified": True,
+        "doc_image_url": pending_context.get("doc_image_url"),
+        "lgd_district_code": pending_context.get("lgd_district_code"),
+        "lgd_taluka_code": pending_context.get("lgd_taluka_code"),
+        "lgd_village_code": pending_context.get("lgd_village_code"),
+        "gis_code": pending_context.get("gis_code"),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -262,6 +413,8 @@ async def register_land(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to register land parcel.",
         ) from exc
+
+    _clear_pending_land_context(current_user["id"], body.survey_number)
 
     logger.info("Land parcel %s registered for user %s", land_id, current_user["id"])
     return LandRegisterResponse(
@@ -288,11 +441,15 @@ async def list_lands(
         items: List[LandListItem] = []
         for parcel in page_items:
             audits_response = (
-                supabase_client.table("carbon_audits")
-                .select("id, status, audit_year, created_at")
-                .eq("land_id", parcel["id"])
-                .order("audit_year", desc=True)
-                .execute()
+                await run_in_threadpool(
+                    lambda parcel_id=parcel["id"]: (
+                        supabase_client.table("carbon_audits")
+                        .select("id, status, audit_year, created_at")
+                        .eq("land_id", parcel_id)
+                        .order("audit_year", desc=True)
+                        .execute()
+                    )
+                )
             )
             audit_rows = audits_response.data or []
             last_audit_year = next(
@@ -312,9 +469,10 @@ async def list_lands(
             try:
                 boundary_geojson = parcel.get("boundary_geojson") or parcel.get("geojson")
                 if boundary_geojson:
-                    thumbnail_url = satellite_service.generate_true_color_thumbnail_url(
+                    thumbnail_url = await run_in_threadpool(
+                        satellite_service.generate_true_color_thumbnail_url,
                         boundary_geojson,
-                        dimensions=512,
+                        512,
                     )
             except Exception as exc:
                 logger.warning("Failed to generate thumbnail for land %s: %s", parcel["id"], exc)
@@ -349,7 +507,7 @@ async def list_lands(
 
 
 @router.patch("/{land_id}", response_model=LandUpdateResponse, status_code=status.HTTP_200_OK)
-async def update_land_name(
+def update_land_name(
     land_id: str,
     body: LandUpdateRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -367,15 +525,22 @@ async def update_land_name(
             supabase_client.table("land_parcels")
             .select("id, user_id")
             .eq("id", land_id)
-            .single()
+            .maybe_single()
             .execute()
         )
         land_data = land_response.data
     except Exception as exc:
+        logger.error("Failed to load land parcel %s for rename: %s", land_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load land parcel.",
+        ) from exc
+
+    if not land_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Land parcel not found",
-        ) from exc
+        )
 
     if land_data.get("user_id") != current_user["id"]:
         raise HTTPException(

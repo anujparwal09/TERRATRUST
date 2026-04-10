@@ -1,4 +1,3 @@
-import asyncio
 import importlib
 import sys
 import types
@@ -251,7 +250,7 @@ def test_get_current_user_returns_503_for_profile_provisioning_errors(monkeypatc
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(dependencies.get_current_user("Bearer test-token"))
+        dependencies.get_current_user("Bearer test-token")
 
     assert exc_info.value.status_code == 503
 
@@ -270,11 +269,9 @@ def test_register_wallet_is_idempotent_when_same_wallet_is_already_saved(monkeyp
     fake_client = _FakeSupabaseClient(users_store)
     monkeypatch.setattr(auth_router, "supabase_client", fake_client)
 
-    response = asyncio.run(
-        auth_router.register_wallet(
-            auth_router.WalletRegisterRequest(wallet_address=WALLET_ONE.lower()),
-            current_user={"id": "user-1", "wallet_address": WALLET_ONE},
-        )
+    response = auth_router.register_wallet(
+        auth_router.WalletRegisterRequest(wallet_address=WALLET_ONE.lower()),
+        current_user={"id": "user-1", "wallet_address": WALLET_ONE},
     )
 
     assert response.status == "success"
@@ -296,11 +293,9 @@ def test_register_wallet_rejects_wallet_replacement(monkeypatch):
     monkeypatch.setattr(auth_router, "supabase_client", fake_client)
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            auth_router.register_wallet(
-                auth_router.WalletRegisterRequest(wallet_address=WALLET_TWO),
-                current_user={"id": "user-1", "wallet_address": WALLET_ONE},
-            )
+        auth_router.register_wallet(
+            auth_router.WalletRegisterRequest(wallet_address=WALLET_TWO),
+            current_user={"id": "user-1", "wallet_address": WALLET_ONE},
         )
 
     assert exc_info.value.status_code == 409
@@ -321,11 +316,9 @@ def test_register_wallet_rejects_case_insensitive_duplicate_for_other_user(monke
     monkeypatch.setattr(auth_router, "supabase_client", fake_client)
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            auth_router.register_wallet(
-                auth_router.WalletRegisterRequest(wallet_address=WALLET_ONE.lower()),
-                current_user={"id": "user-1", "wallet_address": None},
-            )
+        auth_router.register_wallet(
+            auth_router.WalletRegisterRequest(wallet_address=WALLET_ONE.lower()),
+            current_user={"id": "user-1", "wallet_address": None},
         )
 
     assert exc_info.value.status_code == 409

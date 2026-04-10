@@ -1,5 +1,3 @@
-const fs = require("fs");
-const path = require("path");
 const hre = require("hardhat");
 
 async function waitForDeployment(contract) {
@@ -35,18 +33,6 @@ async function main() {
 
   const contractAddress = await getContractAddress(token);
   console.log("TerraTrustToken deployed to:", contractAddress);
-
-  const artifact = await hre.artifacts.readArtifact("TerraTrustToken");
-  const outputPaths = [
-    path.join(__dirname, "..", "artifacts", "TerraToken_ABI.json"),
-    path.join(__dirname, "..", "artifacts", "TerraTrustToken_ABI.json")
-  ];
-
-  outputPaths.forEach((outputPath) => {
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, JSON.stringify(artifact.abi, null, 2));
-    console.log("ABI exported to:", outputPath);
-  });
 }
 
 main().catch((error) => {

@@ -115,3 +115,7 @@ def test_calculate_credits_uses_zero_credit_baseline_when_no_previous_audit(monk
     assert result["credits_issued"] == 0
     assert result["delta_biomass"] == 0
     assert result["reason"] == "Baseline year established; future growth earns credits."
+
+
+def test_normalise_species_name_accepts_scientific_aliases():
+    assert fusion_engine.normalise_species_name("Dalbergia sissoo") == "Indian Rosewood"

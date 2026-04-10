@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import io
 import logging
 from collections import Counter
 from datetime import datetime, timezone
@@ -10,12 +11,15 @@ from typing import Any, Dict, List
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from shapely.geometry import Point, shape
+from PIL import Image, UnidentifiedImageError
+from starlette.concurrency import run_in_threadpool
 
 from app.database import (
+    delete_tree_scan_records_for_audit,
     fetch_land_parcel_record,
     insert_sampling_zone_records,
     insert_tree_scan_record,
+    land_contains_point,
     list_sampling_zones_for_audit,
     supabase_client,
 )
@@ -29,30 +33,25 @@ from models.audit import (
     ZoneResponse,
 )
 from services import zone_generation_service
-from services.fusion_engine import SPECIES_WOOD_DENSITY
+from services.fusion_engine import normalise_species_name, wood_density_for_species
 from services.ipfs_service import to_gateway_url
 
 logger = logging.getLogger("terratrust.audit")
 
 router = APIRouter()
 
-ALLOWED_SPECIES = {species.casefold(): species for species in SPECIES_WOOD_DENSITY}
-
+MAX_EVIDENCE_WIDTH = 1280
+MAX_EVIDENCE_HEIGHT = 960
 
 def _normalise_species_name(species: str) -> str:
     """Return the canonical supported species name or fail clearly."""
-    canonical = ALLOWED_SPECIES.get(species.strip().casefold())
-    if canonical:
-        return canonical
-
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=(
-            "Unsupported tree species. Allowed values are: "
-            + ", ".join(sorted(SPECIES_WOOD_DENSITY))
-            + "."
-        ),
-    )
+    try:
+        return normalise_species_name(species)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
 
 def _decode_evidence_photo(photo_base64: str, expected_hash: str) -> bytes:
@@ -78,24 +77,40 @@ def _decode_evidence_photo(photo_base64: str, expected_hash: str) -> bytes:
             detail="Evidence photo hash does not match the uploaded photo bytes.",
         )
 
-    return photo_bytes
-
-
-def _require_point_within_boundary(lat: float, lng: float, boundary_geojson: Dict[str, Any]) -> None:
-    """Ensure a tree point lies within the registered parcel boundary."""
     try:
-        boundary_geometry = shape(boundary_geojson)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Registered land parcel has invalid boundary geometry.",
-        ) from exc
+        with Image.open(io.BytesIO(photo_bytes)) as image:
+            image.load()
 
-    if not boundary_geometry.covers(Point(lng, lat)):
+            if image.format != "JPEG":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Evidence photo must be final JPEG bytes without a data URI prefix.",
+                )
+
+            if image.width > MAX_EVIDENCE_WIDTH or image.height > MAX_EVIDENCE_HEIGHT:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "Evidence photo exceeds the maximum supported size of "
+                        f"{MAX_EVIDENCE_WIDTH}x{MAX_EVIDENCE_HEIGHT}."
+                    ),
+                )
+
+            exif = image.getexif()
+            if exif and len(exif) > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Evidence photo must be EXIF-stripped before upload.",
+                )
+    except HTTPException:
+        raise
+    except UnidentifiedImageError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tree sample GPS point lies outside the registered land boundary.",
-        )
+            detail="Evidence photo bytes do not decode into a valid JPEG image.",
+        ) from exc
+
+    return photo_bytes
 
 
 def _distance_metres(first_lat: float, first_lng: float, second_lat: float, second_lng: float) -> float:
@@ -156,14 +171,16 @@ async def get_audit_zones(
         )
 
     audit_year = datetime.now(timezone.utc).year
-    existing_audit_resp = (
-        supabase_client.table("carbon_audits")
-        .select("id, status")
-        .eq("land_id", land_id)
-        .eq("audit_year", audit_year)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
+    existing_audit_resp = await run_in_threadpool(
+        lambda: (
+            supabase_client.table("carbon_audits")
+            .select("id, status")
+            .eq("land_id", land_id)
+            .eq("audit_year", audit_year)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
     )
     existing_audit = (existing_audit_resp.data or [None])[0]
     audit_id = str(uuid.uuid4())
@@ -179,24 +196,39 @@ async def get_audit_zones(
         if existing_status in {"PROCESSING", "CALCULATING", "READY_TO_MINT"}:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="This land already has an audit in progress for the current year.",
+                detail={
+                    "error": "An audit already exists for this land in the current audit year.",
+                    "existing_audit_id": existing_audit["id"],
+                    "status": existing_status,
+                },
             )
 
         audit_id = existing_audit["id"]
-        supabase_client.table("sampling_zones").delete().eq("audit_id", audit_id).execute()
-        supabase_client.table("carbon_audits").update(
-            {
-                "status": "PROCESSING",
-                "error": None,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ).eq("id", audit_id).execute()
+        await delete_tree_scan_records_for_audit(audit_id)
+        await run_in_threadpool(
+            lambda: supabase_client.table("sampling_zones").delete().eq("audit_id", audit_id).execute()
+        )
+        await run_in_threadpool(
+            lambda: (
+                supabase_client.table("carbon_audits")
+                .update(
+                    {
+                        "status": "PROCESSING",
+                        "error": None,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                .eq("id", audit_id)
+                .execute()
+            )
+        )
 
     # Generate zones
     try:
-        zones = zone_generation_service.generate_sampling_zones(
-            land_id=land_id,
-            boundary_geojson=boundary_geojson,
+        zones = await run_in_threadpool(
+            zone_generation_service.generate_sampling_zones,
+            land_id,
+            boundary_geojson,
         )
     except Exception as exc:
         logger.error("Zone generation failed for land %s: %s", land_id, exc)
@@ -209,16 +241,22 @@ async def get_audit_zones(
     walking_path = zones[0].get("walking_path_metres", 0) if zones else 0
 
     if not existing_audit:
-        supabase_client.table("carbon_audits").insert(
-            {
-                "id": audit_id,
-                "land_id": land_id,
-                "user_id": current_user["id"],
-                "audit_year": audit_year,
-                "status": "PROCESSING",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ).execute()
+        await run_in_threadpool(
+            lambda: (
+                supabase_client.table("carbon_audits")
+                .insert(
+                    {
+                        "id": audit_id,
+                        "land_id": land_id,
+                        "user_id": current_user["id"],
+                        "audit_year": audit_year,
+                        "status": "PROCESSING",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                .execute()
+            )
+        )
 
     await insert_sampling_zone_records(land_id=land_id, audit_id=audit_id, zones=zones)
 
@@ -267,19 +305,28 @@ async def submit_samples(
     trees = body.trees
 
     try:
-        audit_resp = (
-            supabase_client.table("carbon_audits")
-            .select("id, user_id, land_id, status")
-            .eq("id", body.audit_id)
-            .single()
-            .execute()
+        audit_resp = await run_in_threadpool(
+            lambda: (
+                supabase_client.table("carbon_audits")
+                .select("id, user_id, land_id, status")
+                .eq("id", body.audit_id)
+                .maybe_single()
+                .execute()
+            )
         )
         audit_data = audit_resp.data
     except Exception as exc:
+        logger.error("Failed to load audit %s for sample submission: %s", body.audit_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load audit session.",
+        ) from exc
+
+    if not audit_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Audit '{body.audit_id}' not found.",
-        ) from exc
+        )
 
     if audit_data.get("user_id") != current_user["id"] or audit_data.get("land_id") != body.land_id:
         raise HTTPException(
@@ -291,27 +338,6 @@ async def submit_samples(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Tree samples can only be submitted while the audit is in PROCESSING state.",
-        )
-
-    try:
-        land_data = await fetch_land_parcel_record(body.land_id)
-    except LookupError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Land parcel '{body.land_id}' not found.",
-        ) from exc
-    except Exception as exc:
-        logger.error("Failed to load land parcel %s for audit submission: %s", body.land_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load land parcel data.",
-        ) from exc
-
-    boundary_geojson = land_data.get("boundary_geojson")
-    if not boundary_geojson:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Registered land parcel is missing boundary geometry.",
         )
 
     # --- Minimum total check -----------------------------------------------
@@ -402,6 +428,16 @@ async def submit_samples(
             zone = zone_map[tree.zone_id]
             centre = zone["centre_gps"]
             radius_metres = float(zone["radius_metres"])
+
+            if not zone.get("gedi_available") and tree.height_m is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Tree sample in zone '{tree.zone_id}' requires AR fallback height "
+                        "because GEDI is unavailable for this zone."
+                    ),
+                )
+
             distance_metres = _distance_metres(
                 tree.gps.lat,
                 tree.gps.lng,
@@ -424,20 +460,49 @@ async def submit_samples(
             detail="Failed to validate sampling zones for this audit.",
         ) from exc
 
-    # --- Process each tree ------------------------------------------------
+    # --- Validate each tree before mutating persisted scans ----------------
+    prepared_scans: List[Dict[str, Any]] = []
     for index, tree in enumerate(trees):
         species_name = canonical_species[index]
-        wood_density = SPECIES_WOOD_DENSITY[species_name]
-        _require_point_within_boundary(tree.gps.lat, tree.gps.lng, boundary_geojson)
+        wood_density = wood_density_for_species(species_name)
+
+        if not await land_contains_point(body.land_id, tree.gps.lat, tree.gps.lng):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Tree sample GPS point lies outside the registered land boundary.",
+            )
+
         photo_bytes = _decode_evidence_photo(
             tree.evidence_photo_base64,
             tree.evidence_photo_hash,
         )
 
-        photo_storage_path = f"audit-photos/{body.audit_id}/{tree.zone_id}/{uuid.uuid4()}.jpg"
+        prepared_scans.append(
+            {
+                "tree": tree,
+                "species_name": species_name,
+                "wood_density": wood_density,
+                "photo_bytes": photo_bytes,
+            }
+        )
+
+    # --- Process each tree ------------------------------------------------
+    await delete_tree_scan_records_for_audit(body.audit_id)
+
+    for prepared_scan in prepared_scans:
+        tree = prepared_scan["tree"]
+        species_name = prepared_scan["species_name"]
+        wood_density = prepared_scan["wood_density"]
+        photo_bytes = prepared_scan["photo_bytes"]
+
+        scan_id = str(uuid.uuid4())
+        photo_storage_path = f"{body.audit_id}/{scan_id}.jpg"
         try:
-            supabase_client.storage.from_("evidence-photos").upload(
-                photo_storage_path, photo_bytes
+            await run_in_threadpool(
+                lambda: supabase_client.storage.from_("evidence-photos").upload(
+                    photo_storage_path,
+                    photo_bytes,
+                )
             )
         except Exception as exc:
             logger.error("Photo upload failed for audit %s: %s", body.audit_id, exc)
@@ -448,7 +513,7 @@ async def submit_samples(
 
         # Insert into ar_tree_scans table
         scan_record = {
-            "id": str(uuid.uuid4()),
+            "id": scan_id,
             "audit_id": body.audit_id,
             "land_id": body.land_id,
             "zone_id": tree.zone_id,
@@ -472,14 +537,39 @@ async def submit_samples(
         await insert_tree_scan_record(scan_record)
 
     # --- Update audit status -----------------------------------------------
-    supabase_client.table("carbon_audits").update(
-        {"status": "CALCULATING"}
-    ).eq("id", body.audit_id).execute()
+    await run_in_threadpool(
+        lambda: (
+            supabase_client.table("carbon_audits")
+            .update({"status": "CALCULATING", "error": None})
+            .eq("id", body.audit_id)
+            .execute()
+        )
+    )
 
     # --- Trigger fusion task -----------------------------------------------
     from tasks.fusion_task import run_audit_fusion
 
-    run_audit_fusion.delay(body.audit_id)
+    try:
+        run_audit_fusion.delay(body.audit_id)
+    except Exception as exc:
+        logger.error("Failed to enqueue fusion task for audit %s: %s", body.audit_id, exc)
+        await run_in_threadpool(
+            lambda: (
+                supabase_client.table("carbon_audits")
+                .update(
+                    {
+                        "status": "PROCESSING",
+                        "error": "Fusion task queue is temporarily unavailable.",
+                    }
+                )
+                .eq("id", body.audit_id)
+                .execute()
+            )
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Satellite processing queue is temporarily unavailable. Please try submitting again.",
+        ) from exc
 
     logger.info(
         "Submitted %d tree samples for audit %s — fusion enqueued.",
@@ -499,7 +589,7 @@ async def submit_samples(
 # GET /result/{audit_id}
 # ---------------------------------------------------------------------------
 @router.get("/result/{audit_id}")
-async def get_audit_result(
+def get_audit_result(
     audit_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -516,15 +606,22 @@ async def get_audit_result(
             supabase_client.table("carbon_audits")
             .select("*")
             .eq("id", audit_id)
-            .single()
+            .maybe_single()
             .execute()
         )
         audit = resp.data
     except Exception as exc:
+        logger.error("Failed to load audit result for %s: %s", audit_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load audit result.",
+        ) from exc
+
+    if not audit:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Audit '{audit_id}' not found.",
-        ) from exc
+        )
 
     if audit.get("user_id") != current_user["id"]:
         raise HTTPException(
@@ -537,7 +634,6 @@ async def get_audit_result(
     if current_status == "MINTED":
         return {
             "status": "MINTED",
-            "audit_id": audit_id,
             "total_biomass_tonnes": audit.get("total_biomass_tonnes"),
             "credits_issued": audit.get("credits_issued"),
             "tx_hash": audit.get("tx_hash"),
@@ -550,7 +646,6 @@ async def get_audit_result(
     if current_status == "COMPLETE_NO_CREDITS":
         return {
             "status": "COMPLETE_NO_CREDITS",
-            "audit_id": audit_id,
             "total_biomass_tonnes": audit.get("total_biomass_tonnes"),
             "credits_issued": audit.get("credits_issued") or 0,
             "audit_year": audit.get("audit_year"),
@@ -558,16 +653,15 @@ async def get_audit_result(
         }
 
     if current_status in ("CALCULATING", "PROCESSING", "READY_TO_MINT"):
-        return {"status": "CALCULATING", "audit_id": audit_id}
+        return {"status": "CALCULATING"}
 
     if current_status == "FAILED":
         return {
             "status": "FAILED",
-            "audit_id": audit_id,
             "error": audit.get("error", "Unknown error"),
         }
 
-    return {"status": current_status, "audit_id": audit_id}
+    return {"status": current_status}
 
 
 @router.get(
@@ -575,7 +669,7 @@ async def get_audit_result(
     response_model=AuditHistoryResponse,
     status_code=status.HTTP_200_OK,
 )
-async def get_audit_history(
+def get_audit_history(
     land_id: str,
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
@@ -587,15 +681,22 @@ async def get_audit_history(
             supabase_client.table("land_parcels")
             .select("id, user_id")
             .eq("id", land_id)
-            .single()
+            .maybe_single()
             .execute()
         )
         land_data = land_resp.data
     except Exception as exc:
+        logger.error("Failed to load land %s for audit history: %s", land_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load land parcel.",
+        ) from exc
+
+    if not land_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Land parcel '{land_id}' not found.",
-        ) from exc
+        )
 
     if land_data.get("user_id") != current_user["id"]:
         raise HTTPException(

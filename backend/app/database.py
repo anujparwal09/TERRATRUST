@@ -4,15 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from supabase import Client, create_client
 
 from app.config import settings
@@ -25,7 +20,6 @@ supabase_client: Client = create_client(
 )
 
 async_engine: Optional[AsyncEngine] = None
-async_session: Optional[async_sessionmaker[AsyncSession]] = None
 
 if settings.DATABASE_URL:
     async_engine = create_async_engine(
@@ -33,11 +27,6 @@ if settings.DATABASE_URL:
         echo=settings.ENVIRONMENT == "development",
         pool_size=5,
         max_overflow=10,
-    )
-    async_session = async_sessionmaker(
-        async_engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
     )
 else:
     logger.warning(
@@ -52,30 +41,6 @@ def _require_async_engine() -> AsyncEngine:
             "DATABASE_URL must be configured for PostGIS-backed backend operations."
         )
     return async_engine
-
-
-def _require_async_session_factory() -> async_sessionmaker[AsyncSession]:
-    """Return the async session factory or fail with a clear setup error."""
-    if async_session is None:
-        raise RuntimeError(
-            "DATABASE_URL must be configured for direct PostgreSQL sessions."
-        )
-    return async_session
-
-
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Yield an async PostgreSQL session for a single request."""
-    session_factory = _require_async_session_factory()
-
-    async with session_factory() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
 
 
 def _decode_json_value(value: Any) -> Any:
@@ -160,6 +125,28 @@ async def fetch_land_parcel_record(land_id: str) -> Dict[str, Any]:
     data["boundary_geojson"] = _decode_json_value(data.get("boundary_geojson"))
     data["geojson"] = data.get("boundary_geojson")
     return data
+
+
+async def land_contains_point(land_id: str, lat: float, lng: float) -> bool:
+    """Return whether a GPS point lies inside a registered land boundary."""
+    engine = _require_async_engine()
+    query = text(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM land_parcels
+            WHERE id = :land_id
+              AND ST_Contains(
+                  geom,
+                  ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)
+              )
+        ) AS inside
+        """
+    )
+
+    async with engine.connect() as conn:
+        result = await conn.execute(query, {"land_id": land_id, "lat": lat, "lng": lng})
+        return bool(result.scalar_one())
 
 
 async def insert_land_parcel_record(land_record: Dict[str, Any]) -> Dict[str, Any]:
@@ -505,6 +492,22 @@ async def list_tree_scans_for_audit(audit_id: str) -> List[Dict[str, Any]]:
         }
         scans.append(scan)
     return scans
+
+
+async def delete_tree_scan_records_for_audit(audit_id: str) -> int:
+    """Delete all persisted tree scans for an audit and return the deleted row count."""
+    engine = _require_async_engine()
+    query = text(
+        """
+        DELETE FROM ar_tree_scans
+        WHERE audit_id = :audit_id
+        """
+    )
+
+    async with engine.begin() as conn:
+        result = await conn.execute(query, {"audit_id": audit_id})
+
+    return int(result.rowcount or 0)
 
 
 async def update_tree_scan_measurements(measurements: List[Dict[str, Any]]) -> None:

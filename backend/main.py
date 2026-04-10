@@ -4,9 +4,11 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 load_dotenv()
 
@@ -86,6 +88,38 @@ app.include_router(audit.router, prefix="/api/v1/audit", tags=["Audit"])
 app.include_router(credits.router, prefix="/api/v1/credits", tags=["Credits"])
 
 
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(_request: Request, exc: StarletteHTTPException):
+    """Return documented error payloads while preserving structured details."""
+    content = exc.detail if isinstance(exc.detail, dict) else {"error": exc.detail}
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=content,
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(
+    _request: Request,
+    exc: RequestValidationError,
+):
+    """Collapse FastAPI validation errors into the documented API error envelope."""
+    messages: list[str] = []
+    for error in exc.errors():
+        location = " -> ".join(str(item) for item in error.get("loc", []))
+        message = error.get("msg", "Invalid value.")
+        messages.append(f"{location}: {message}" if location else message)
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "Invalid request payload.",
+            "details": messages,
+        },
+    )
+
+
 @app.middleware("http")
 async def maintenance_mode_middleware(request: Request, call_next):
     """Return the documented 503 payload when maintenance mode is active."""
@@ -135,15 +169,23 @@ async def application_status():
 # Startup event — initialise external SDKs
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
-async def startup_event():
-    """Initialise Firebase Admin and Google Earth Engine on startup."""
+def startup_event():
+    """Initialise critical external SDKs and fail fast when they are unavailable."""
+    startup_errors: list[str] = []
+
     try:
         get_firebase_app()
         logger.info("Firebase Admin initialised.")
     except Exception as exc:
-        logger.warning("Failed to initialise Firebase Admin: %s", exc)
+        logger.exception("Failed to initialise Firebase Admin.")
+        startup_errors.append(f"Firebase Admin initialisation failed: {exc}")
 
     try:
         ensure_gee_initialized()
+        logger.info("Google Earth Engine initialised.")
     except Exception as exc:
-        logger.error("Failed to initialise Google Earth Engine: %s", exc)
+        logger.exception("Failed to initialise Google Earth Engine.")
+        startup_errors.append(f"Google Earth Engine initialisation failed: {exc}")
+
+    if startup_errors:
+        raise RuntimeError("; ".join(startup_errors))

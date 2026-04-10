@@ -76,6 +76,7 @@ def test_build_audit_metadata_hashes_boundary_and_preserves_tree_details():
                 "gedi_height_m": 15.3,
                 "height_source": "GEDI",
                 "agb_kg": 245.6,
+                "scan_timestamp": "2026-11-10T10:24:31Z",
                 "ar_tier_used": 1,
                 "gps": {"lat": 18.546, "lng": 73.981},
                 "evidence_photo_hash": "abc123",
@@ -110,6 +111,7 @@ def test_build_audit_metadata_hashes_boundary_and_preserves_tree_details():
     ).hexdigest()
 
     assert metadata["land_boundary_hash"] == expected_hash
+    assert metadata["measurement_date"] == "2026-11-10"
     assert metadata["tree_samples"][0]["height_source"] == "GEDI"
     assert metadata["tree_samples"][0]["height_m"] == 15.3
     assert metadata["tree_samples"][0]["agb_kg"] == 245.6
@@ -117,7 +119,7 @@ def test_build_audit_metadata_hashes_boundary_and_preserves_tree_details():
     assert metadata["boundary_verification_method"] == "WMS_AUTO"
 
 
-def test_coerce_credit_amount_rounds_to_whole_token_units():
+def test_coerce_credit_amount_truncates_to_whole_token_units():
     assert _coerce_credit_amount(4.1) == 4
-    assert _coerce_credit_amount(4.6) == 5
+    assert _coerce_credit_amount(4.6) == 4
     assert _coerce_credit_amount(0.2) == 0

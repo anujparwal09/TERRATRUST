@@ -17,6 +17,8 @@ from app.gee import ensure_gee_initialized
 
 logger = logging.getLogger("terratrust.zones")
 
+ACRE_TO_HECTARES = 0.40468564224
+
 
 def _ensure_gee_initialised() -> None:
     """Initialise GEE if not already done (idempotent)."""
@@ -46,18 +48,18 @@ def _label_for_index(index: int) -> str:
 
 
 def _determine_zone_plan(area_hectares: float) -> tuple[int, float]:
-    """Choose zone count and radius from the documented area bands."""
-    if area_hectares <= 0.4:
+    """Choose zone count and radius from the documented farm-size bands."""
+    if area_hectares <= 1 * ACRE_TO_HECTARES:
         return 3, 7.0
-    if area_hectares <= 1.2:
+    if area_hectares <= 3 * ACRE_TO_HECTARES:
         return 4, 9.0
-    if area_hectares <= 4.1:
+    if area_hectares <= 10 * ACRE_TO_HECTARES:
         return 5, 11.0
     return 6, 11.0
 
 
 def _distribute_zone_counts(zone_count: int) -> Dict[str, int]:
-    """Spread requested zones across low / medium / high NDVI bands."""
+    """Spread the requested zones across low, medium, and high NDVI bands."""
     counts = {
         "low_density": zone_count // 3,
         "medium_density": zone_count // 3,
@@ -356,11 +358,23 @@ def generate_sampling_zones(
         "medium_density": ndvi.gte(p25).And(ndvi.lt(p75)),
         "low_density": ndvi.lt(p25),
     }
+    required_zone_types = ("high_density", "medium_density", "low_density")
 
     sampled_zone_points: List[Dict[str, Any]] = []
+    zone_type_counts = {zone_type: 0 for zone_type in required_zone_types}
     seen_points: set[tuple[float, float]] = set()
 
-    for offset, zone_type in enumerate(("high_density", "medium_density", "low_density")):
+    def append_zone_point(point: Dict[str, Any], zone_type: str) -> bool:
+        key = (round(point["lat"], 6), round(point["lng"], 6))
+        if key in seen_points:
+            return False
+
+        seen_points.add(key)
+        sampled_zone_points.append({**point, "zone_type": zone_type})
+        zone_type_counts[zone_type] += 1
+        return True
+
+    for offset, zone_type in enumerate(required_zone_types):
         class_points = _sample_zone_points(
             ndvi,
             region,
@@ -369,69 +383,61 @@ def generate_sampling_zones(
             mask=zone_masks[zone_type],
         )
         for point in class_points:
-            key = (round(point["lat"], 6), round(point["lng"], 6))
-            if key in seen_points:
-                continue
-            seen_points.add(key)
-            sampled_zone_points.append({**point, "zone_type": zone_type})
+            append_zone_point(point, zone_type)
 
     if len(sampled_zone_points) < target_zone_count:
         supplemental_points = _sample_zone_points(
             ndvi,
             region,
-            target_zone_count - len(sampled_zone_points),
+            target_zone_count * 4,
             seed=97,
         )
         for point in supplemental_points:
-            key = (round(point["lat"], 6), round(point["lng"], 6))
-            if key in seen_points:
+            zone_type = _classify_zone_type(point.get("ndvi_mean"), p25, p75)
+            if zone_type_counts[zone_type] >= zone_counts[zone_type]:
                 continue
-            seen_points.add(key)
-            sampled_zone_points.append(
-                {
-                    **point,
-                    "zone_type": _classify_zone_type(point.get("ndvi_mean"), p25, p75),
-                }
-            )
-
-    centroid_point = _region_centroid_point(ndvi, region)
-    supplemental_seed = 197
-    supplemental_attempts = 0
-    while len(sampled_zone_points) < target_zone_count and supplemental_attempts < 5:
-        supplemental_points = _sample_zone_points(
-            ndvi,
-            region,
-            max((target_zone_count - len(sampled_zone_points)) * 3, 3),
-            seed=supplemental_seed + supplemental_attempts,
-        )
-        for point in supplemental_points:
-            key = (round(point["lat"], 6), round(point["lng"], 6))
-            if key in seen_points:
+            if not append_zone_point(point, zone_type):
                 continue
-            seen_points.add(key)
-            sampled_zone_points.append(
-                {
-                    **point,
-                    "zone_type": _classify_zone_type(point.get("ndvi_mean"), p25, p75),
-                }
-            )
             if len(sampled_zone_points) >= target_zone_count:
                 break
-        supplemental_attempts += 1
 
-    if len(sampled_zone_points) < target_zone_count:
-        fallback_points = _interior_fallback_points(
+    centroid_point = _region_centroid_point(ndvi, region)
+    fallback_points = [
+        centroid_point,
+        *_interior_fallback_points(
             boundary_geojson,
-            target_zone_count - len(sampled_zone_points),
+            max(target_zone_count * 2, target_zone_count - len(sampled_zone_points)),
             centroid_point.get("ndvi_mean"),
-        )
-        for point in fallback_points:
-            sampled_zone_points.append(
-                {
-                    **point,
-                    "zone_type": _classify_zone_type(point.get("ndvi_mean"), p25, p75),
-                }
+        ),
+    ]
+    for zone_type in required_zone_types:
+        while zone_type_counts[zone_type] < zone_counts[zone_type]:
+            added = False
+            for point in fallback_points:
+                if append_zone_point(point, zone_type):
+                    added = True
+                    break
+
+            if added:
+                continue
+
+            extra_points = _interior_fallback_points(
+                boundary_geojson,
+                target_zone_count * 2,
+                centroid_point.get("ndvi_mean"),
             )
+            fallback_points.extend(extra_points)
+            for point in extra_points:
+                if append_zone_point(point, zone_type):
+                    added = True
+                    break
+
+            if not added:
+                raise ValueError("Failed to generate sufficient sampling zone points inside the parcel.")
+
+    ordered_seed_points = sampled_zone_points[:target_zone_count]
+    if len(ordered_seed_points) != target_zone_count:
+        raise ValueError("Failed to generate the documented number of sampling zones.")
 
     gedi_image = None
     try:
@@ -452,7 +458,7 @@ def generate_sampling_zones(
         "lat": float(route_start_point["lat"] or 0.0),
         "lng": float(route_start_point["lng"] or 0.0),
     }
-    ordered_zone_points = _order_zone_points(sampled_zone_points, route_start)
+    ordered_zone_points = _order_zone_points(ordered_seed_points, route_start)
     total_walk = _path_length_metres(ordered_zone_points)
 
     zones: List[Dict[str, Any]] = []

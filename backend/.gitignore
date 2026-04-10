@@ -1,7 +1,6 @@
 # Env & secrets
 .env
-gee-service-account.json
-firebase-service-account.json
+backend-google-service-account.json
 
 # Python
 __pycache__/

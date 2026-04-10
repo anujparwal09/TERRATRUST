@@ -44,6 +44,22 @@ def _validate_aadhaar_number(aadhaar_number: str) -> str:
     return candidate
 
 
+def _validate_full_name(full_name: str) -> str:
+    """Validate the documented KYC full-name rules."""
+    candidate = " ".join(full_name.split())
+    if len(candidate) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Full name must be at least 2 characters.",
+        )
+    if not all(character.isalpha() or character.isspace() for character in candidate):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Full name must contain only letters and spaces.",
+        )
+    return candidate
+
+
 def _validate_wallet_address(wallet_address: str) -> str:
     """Validate wallet format and raise the documented 400 response on failure."""
     candidate = wallet_address.strip()
@@ -68,13 +84,13 @@ def _build_auth_me_response(current_user: Dict[str, Any]) -> AuthMeResponse:
 
 
 @router.get("/me", response_model=AuthMeResponse, status_code=status.HTTP_200_OK)
-async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
+def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Return the authenticated farmer profile state for mobile bootstrap."""
     return _build_auth_me_response(current_user)
 
 
 @router.post("/kyc", response_model=KYCResponse, status_code=status.HTTP_200_OK)
-async def submit_kyc(
+def submit_kyc(
     body: KYCRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -86,12 +102,7 @@ async def submit_kyc(
     - Sets ``kyc_completed = true``.
     """
     try:
-        full_name = " ".join(body.full_name.split())
-        if len(full_name) < 2:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Full name must be at least 2 characters.",
-            )
+        full_name = _validate_full_name(body.full_name)
 
         aadhaar_number = _validate_aadhaar_number(body.aadhaar_number)
         aadhaar_hash = hashlib.sha256(aadhaar_number.encode("utf-8")).hexdigest()
@@ -100,6 +111,7 @@ async def submit_kyc(
             "full_name": full_name,
             "aadhaar_hash": aadhaar_hash,
             "kyc_completed": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
         (
@@ -127,7 +139,7 @@ async def submit_kyc(
     response_model=WalletRegisterResponse,
     status_code=status.HTTP_200_OK,
 )
-async def register_wallet(
+def register_wallet(
     body: WalletRegisterRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -158,7 +170,12 @@ async def register_wallet(
 
         (
             supabase_client.table("users")
-            .update({"wallet_address": wallet_address})
+            .update(
+                {
+                    "wallet_address": wallet_address,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             .eq("id", current_user["id"])
             .execute()
         )
@@ -183,7 +200,7 @@ async def register_wallet(
     response_model=WalletRecoveryResponse,
     status_code=status.HTTP_200_OK,
 )
-async def recover_wallet(
+def recover_wallet(
     body: WalletRecoveryRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):

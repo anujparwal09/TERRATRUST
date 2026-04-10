@@ -84,6 +84,8 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
                 "boundary_source": land_data.get("boundary_source"),
                 "boundary_geojson": land_data.get("boundary_geojson") or land_data.get("geojson"),
                 "audit_year": audit_year,
+                "created_at": audit_data.get("created_at"),
+                "calculated_at": audit_data.get("calculated_at"),
             },
             tree_scans=tree_scans,
             credit_result=credit_result,

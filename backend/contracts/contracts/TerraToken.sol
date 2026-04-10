@@ -32,14 +32,6 @@ contract TerraTrustToken is ERC1155, Ownable {
         uint256 timestamp
     );
 
-    event AuditMinted(
-        address indexed farmer,
-        uint256 auditId,
-        uint256 creditAmount,
-        string ipfsHash,
-        uint256 timestamp
-    );
-
     constructor() ERC1155("") Ownable(msg.sender) {}
 
     /**
@@ -52,32 +44,7 @@ contract TerraTrustToken is ERC1155, Ownable {
         string calldata ipfsHash,
         string calldata landId,
         uint256 auditYear
-    ) external onlyOwner {
-        _mintAuditRecord(farmer, auditId, creditAmount, ipfsHash, landId, auditYear);
-    }
-
-    /**
-     * @notice Legacy parameter order retained for backward compatibility.
-     */
-    function mintAudit(
-        address farmer,
-        uint256 auditId,
-        uint256 creditAmount,
-        string calldata landId,
-        uint256 auditYear,
-        string calldata ipfsHash
-    ) external onlyOwner {
-        _mintAuditRecord(farmer, auditId, creditAmount, ipfsHash, landId, auditYear);
-    }
-
-    function _mintAuditRecord(
-        address farmer,
-        uint256 auditId,
-        uint256 creditAmount,
-        string calldata ipfsHash,
-        string calldata landId,
-        uint256 auditYear
-    ) internal {
+    ) public onlyOwner {
         bytes32 auditKey = keccak256(abi.encodePacked(landId, auditYear));
         require(!auditMinted[auditKey], "Credits already minted for this land this year");
         auditMinted[auditKey] = true;
@@ -86,8 +53,6 @@ contract TerraTrustToken is ERC1155, Ownable {
         _mint(farmer, auditId, 1, "");
 
         auditEvidence[auditId] = ipfsHash;
-
-        emit AuditMinted(farmer, auditId, creditAmount, ipfsHash, block.timestamp);
     }
 
     /**
@@ -105,10 +70,6 @@ contract TerraTrustToken is ERC1155, Ownable {
         emit CreditRetired(msg.sender, amount, reason, block.timestamp);
     }
 
-    function retireCredits(uint256 amount) external {
-        retireCredits(amount, "");
-    }
-
     /**
      * @notice Return the IPFS evidence URI for an audit certificate.
      */
@@ -116,5 +77,3 @@ contract TerraTrustToken is ERC1155, Ownable {
         return auditEvidence[auditId];
     }
 }
-
-contract TerraToken is TerraTrustToken {}

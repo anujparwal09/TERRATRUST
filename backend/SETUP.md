@@ -4,7 +4,7 @@
 
 - Python 3.11+
 - Redis running locally or as a managed instance
-- Node.js 18+ for contract tooling
+- Node.js 22.11+ LTS for contract tooling
 - Supabase with PostgreSQL 15 and PostGIS enabled
 - Firebase project with Phone Auth enabled
 - Shared Google backend service account JSON for Firebase Admin, Cloud Vision, and Earth Engine
@@ -150,7 +150,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ## 10. Start the Celery worker
 
 ```bash
-celery -A tasks.celery_app worker --loglevel=info
+celery -A tasks.celery_app worker --loglevel=info --concurrency=1
+```
+
+Optional Render-style local process orchestration:
+
+```bash
+honcho -f Procfile.render start
 ```
 
 ## 11. Run tests

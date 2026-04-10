@@ -27,13 +27,43 @@ SPECIES_WOOD_DENSITY: Dict[str, float] = {
     "Amla": 0.74,
 }
 
-# Default for unknown species
-DEFAULT_WOOD_DENSITY: float = 0.58
+SPECIES_ALIASES: Dict[str, str] = {
+    "dalbergia sissoo": "Indian Rosewood",
+    "shisham": "Indian Rosewood",
+    "north indian rosewood": "Indian Rosewood",
+}
 
 
 def _ensure_gee() -> None:
     """Initialise GEE if not already done."""
     ensure_gee_initialized()
+
+
+def normalise_species_name(species: str) -> str:
+    """Return the canonical approved species label for the submitted name."""
+    candidate = " ".join(species.split()).casefold()
+    if not candidate:
+        raise ValueError("Species name cannot be empty.")
+
+    for approved_species in SPECIES_WOOD_DENSITY:
+        if approved_species.casefold() == candidate:
+            return approved_species
+
+    alias_match = SPECIES_ALIASES.get(candidate)
+    if alias_match:
+        return alias_match
+
+    raise ValueError(
+        "Unsupported tree species. Allowed values are: "
+        + ", ".join(sorted(SPECIES_WOOD_DENSITY))
+        + "."
+    )
+
+
+def wood_density_for_species(species: str) -> float:
+    """Return the documented wood density for a canonical approved species."""
+    canonical_species = normalise_species_name(species)
+    return SPECIES_WOOD_DENSITY[canonical_species]
 
 
 def _extract_scan_gps(scan: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
@@ -75,6 +105,17 @@ def _sample_gedi_height(gedi_image: ee.Image, lat: float, lng: float) -> Optiona
         return height if height > 0 else None
     except Exception:
         return None
+
+
+def _image_has_valid_pixels(image: ee.Image, region: ee.Geometry, scale: int) -> bool:
+    """Return whether an Earth Engine image has any unmasked pixels in a region."""
+    stats = image.reduceRegion(
+        reducer=ee.Reducer.count(),
+        geometry=region,
+        scale=scale,
+        maxPixels=1e8,
+    ).getInfo()
+    return any(((value or 0) > 0) for value in (stats or {}).values())
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +214,15 @@ def run_fusion(
     # -----------------------------------------------------------------------
     # 4. GEDI canopy height
     # -----------------------------------------------------------------------
-    gedi = (
+    raw_gedi = (
         ee.ImageCollection("LARSE/GEDI/GEDI02_A_002_MONTHLY")
         .filterBounds(region)
         .select(["rh98"])
         .mean()
         .rename("GEDI_RH98")
     )
+    gedi_available = _image_has_valid_pixels(raw_gedi, region, scale=25)
+    gedi = raw_gedi.unmask(0) if gedi_available else None
 
     # -----------------------------------------------------------------------
     # 5. SRTM elevation & slope
@@ -190,9 +233,17 @@ def run_fusion(
     # -----------------------------------------------------------------------
     # 6. Stack all bands into a single feature image
     # -----------------------------------------------------------------------
-    feature_stack = ee.Image.cat(
-        [s1_vh, s1_vv, s1_ratio, ndvi, evi, red_edge, gedi, srtm, slope]
-    ).clip(region)
+    feature_bands = [s1_vh, s1_vv, s1_ratio, ndvi, evi, red_edge]
+    band_names = ["S1_VH", "S1_VV", "S1_VH_VV_RATIO", "NDVI", "EVI", "RED_EDGE"]
+
+    if gedi is not None:
+        feature_bands.append(gedi)
+        band_names.append("GEDI_RH98")
+
+    feature_bands.extend([srtm, slope])
+    band_names.extend(["ELEVATION", "SLOPE"])
+
+    feature_stack = ee.Image.cat(feature_bands).clip(region)
 
     # -----------------------------------------------------------------------
     # 7. Compute per-tree AGB using Chave allometric equation
@@ -202,7 +253,7 @@ def run_fusion(
     skipped_scans = 0
 
     for scan in tree_scans:
-        species = scan.get("species", "Unknown")
+        species = normalise_species_name(scan.get("species", ""))
         dbh_cm = float(scan["dbh_cm"])
         lat, lng = _extract_scan_gps(scan)
         if lat is None or lng is None:
@@ -214,8 +265,8 @@ def run_fusion(
             continue
 
         gedi_height_m = scan.get("gedi_height_m")
-        if gedi_height_m is None:
-            gedi_height_m = _sample_gedi_height(gedi, lat, lng)
+        if gedi_height_m is None and gedi_available:
+            gedi_height_m = _sample_gedi_height(raw_gedi, lat, lng)
 
         height_m = gedi_height_m if gedi_height_m is not None else scan.get("height_m")
         if height_m is None or float(height_m) <= 0:
@@ -227,7 +278,7 @@ def run_fusion(
             continue
 
         height_source = "GEDI" if gedi_height_m else "AR_FALLBACK"
-        wood_density = SPECIES_WOOD_DENSITY.get(species, DEFAULT_WOOD_DENSITY)
+        wood_density = wood_density_for_species(species)
 
         # Chave et al. (2014) pan-tropical equation
         agb_kg = 0.0673 * (wood_density * (dbh_cm**2) * height_m) ** 0.976
@@ -257,11 +308,6 @@ def run_fusion(
     # 8. Train XGBoost regressor on GEE
     # -----------------------------------------------------------------------
     training_fc = ee.FeatureCollection(training_points)
-
-    band_names = [
-        "S1_VH", "S1_VV", "S1_VH_VV_RATIO", "NDVI", "EVI", "RED_EDGE", "GEDI_RH98",
-        "ELEVATION", "SLOPE",
-    ]
 
     training_data = feature_stack.sampleRegions(
         collection=training_fc,
@@ -337,7 +383,11 @@ def run_fusion(
             "srtm_slope_mean": sat_stats.get("SLOPE", 0),
             "nisar_used": False,
             "features_count": len(band_names),
-            "processing_method": "S1_S2_GEDI_SRTM_XGBoost_v3.1",
+            "processing_method": (
+                "S1_S2_GEDI_SRTM_XGBoost_v3.1"
+                if gedi_available
+                else "S1_S2_SRTM_XGBoost_v3.1"
+            ),
         },
     }
 
