@@ -1,7 +1,7 @@
 """
 Zone generation service — NDVI-based sampling zone placement using GEE.
 
-Generates 3-6 representative sampling zones (high / medium / low NDVI)
+Generates 2-8 representative sampling zones (high / medium / low NDVI)
 within a land parcel so the farmer walks a stratified path.
 """
 
@@ -48,14 +48,33 @@ def _label_for_index(index: int) -> str:
 
 
 def _determine_zone_plan(area_hectares: float) -> tuple[int, float]:
-    """Choose zone count and radius from the documented farm-size bands."""
-    if area_hectares <= 1 * ACRE_TO_HECTARES:
+    """Choose zone count and radius from the documented farm-size bands.
+
+    TerraTrust v3.1 specifies zone-count ranges by acreage, so this helper
+    scales deterministically within each range instead of returning the same
+    fixed count for every parcel size in a band.
+    """
+    area_acres = area_hectares / ACRE_TO_HECTARES
+
+    if area_acres <= 0.5:
+        return 2, 7.0
+    if area_acres <= 1.0:
         return 3, 7.0
-    if area_hectares <= 3 * ACRE_TO_HECTARES:
+    if area_acres <= 2.0:
+        return 3, 9.0
+    if area_acres <= 3.0:
         return 4, 9.0
-    if area_hectares <= 10 * ACRE_TO_HECTARES:
+    if area_acres <= 5.0:
+        return 4, 11.0
+    if area_acres <= 7.5:
         return 5, 11.0
-    return 6, 11.0
+    if area_acres <= 10.0:
+        return 6, 11.0
+    if area_acres <= 15.0:
+        return 6, 11.0
+    if area_acres <= 25.0:
+        return 7, 11.0
+    return 8, 11.0
 
 
 def _distribute_zone_counts(zone_count: int) -> Dict[str, int]:

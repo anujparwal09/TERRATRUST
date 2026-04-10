@@ -259,7 +259,7 @@ SECTION 2: SYSTEM OVERVIEW AND ARCHITECTURE
    → Total biomass = sum of all pixel predictions.
 
 5. Delta from last year calculated → CO2 credits determined.
-  → Evidence packaged as JSON and uploaded to IPFS via Pinata.
+   → Evidence packaged as JSON and uploaded to IPFS via Pinata.
    → Smart contract mints CTT tokens to farmer's blockchain wallet.
    → IPFS CID and transaction hash stored permanently in database.
 
@@ -615,8 +615,8 @@ Setup steps:
           Select "Academic or research use" category.
           Project description (copy this):
           "Carbon credit verification for smallholder agroforestry
-           farmers in India using multi-modal satellite fusion including
-           Sentinel-1, Sentinel-2, GEDI, NISAR, and SRTM data."
+          farmers in India using multi-modal satellite fusion including
+          Sentinel-1, Sentinel-2, GEDI, NISAR, and SRTM data."
           Submit the form.
           IMPORTANT: Approval takes 1-3 business days.
           Do this step FIRST before anything else.
@@ -633,15 +633,15 @@ Setup steps:
           the project level. Select the correct tier for this project before
           rollout. If no tier is selected by April 27, 2026, the project is
           placed on the Community Tier by default.
-    Step 4: Reuse the same backend-google-service-account.json created in
-      Google Cloud setup above. Do not create a separate Earth Engine
-      key for TerraTrust. The backend uses this file through
-      GOOGLE_APPLICATION_CREDENTIALS so Earth Engine, Firebase Admin,
-      and Cloud Vision share one backend identity.
+  Step 4: Reuse the same backend-google-service-account.json created in
+          Google Cloud setup above. Do not create a separate Earth Engine
+          key for TerraTrust. The backend uses this file through
+          GOOGLE_APPLICATION_CREDENTIALS so Earth Engine, Firebase Admin,
+          and Cloud Vision share one backend identity.
 
 Test GEE authentication (run after setup):
   import ee
-    ee.Initialize(project='[your-google-cloud-project-id]')
+  ee.Initialize(project='[your-google-cloud-project-id]')
   print(ee.Number(42).getInfo())   # Must print: 42
 
 ────────────────────────────────────────────────
@@ -659,26 +659,26 @@ Setup steps:
           phrase on paper. Store it offline and safely. If this is
           lost, the wallet cannot be recovered — ever.
   Step 3: Add Polygon Amoy Testnet (for development):
-      Click the network dropdown → Add network → Add manually.
-      Network Name:   Polygon Amoy Testnet
-      RPC URL:        https://rpc-amoy.polygon.technology/
-      Chain ID:       80002
-      Currency Symbol: POL
-      Block Explorer: https://amoy.polygonscan.com
-      Click Save.
+          Click the network dropdown → Add network → Add manually.
+          Network Name:   Polygon Amoy Testnet
+          RPC URL:        https://rpc-amoy.polygon.technology/
+          Chain ID:       80002
+          Currency Symbol: POL
+          Block Explorer: https://amoy.polygonscan.com
+          Click Save.
   Step 4: Get free test POL (for Amoy testnet — not real money):
-      Go to faucet.polygon.technology.
-      Connect MetaMask. Request test POL.
-      You need test POL to pay gas fees during development.
+          Go to faucet.polygon.technology.
+          Connect MetaMask. Request test POL.
+          You need test POL to pay gas fees during development.
   Step 5: Export your private key:
-      MetaMask → Account Details → Export Private Key.
-      Enter your MetaMask password.
-      Copy the private key (starts with 0x).
-      This is your ADMIN_WALLET_PRIVATE_KEY.
-      NEVER share this. NEVER commit to git. Store in .env only.
+          MetaMask → Account Details → Export Private Key.
+          Enter your MetaMask password.
+          Copy the private key (starts with 0x).
+          This is your ADMIN_WALLET_PRIVATE_KEY.
+          NEVER share this. NEVER commit to git. Store in .env only.
   NOTE: Polygon documentation now labels the gas token as POL. Older
-      tutorials may still say MATIC, but use the Amoy faucet and Amoy
-      explorer values above for this project.
+        tutorials may still say MATIC, but use the Amoy faucet and Amoy
+        explorer values above for this project.
 
 Environment variables from this step:
   ADMIN_WALLET_PRIVATE_KEY=[0x...exported private key]
@@ -965,6 +965,13 @@ SCREEN: KYCScreen
   Why name matters:  This name is matched against the OCR-extracted owner
                      name from the 7/12 document in Module 2. If they do
                      not match, land registration is rejected.
+  Why Aadhaar is collected:
+                     OTP proves control of the phone number, but not the
+                     farmer's real-world identity. TerraTrust uses Aadhaar in
+                     v3.1 as the one-time KYC identifier so the backend can
+                     bind the account to a farmer identity, compare that KYC
+                     name against the 7/12 owner name, and re-verify the same
+                     person during wallet recovery.
   On submit:         POST /api/v1/auth/kyc to backend.
                      Backend stores: full_name, SHA-256 hash of Aadhaar
                      (never plain text), sets kyc_completed = true.
@@ -1130,7 +1137,9 @@ LAYER 2 — BhuNaksha Web Scraping (Fallback if Layer 1 WMS fails)
   Himachal Pradesh, Uttarakhand).
 
 LAYER 3 — Manual Guided Upload (Universal Fallback)
-  Used when: Layer 1 and Layer 2 both fail, OR state not yet integrated.
+  Used when: Layer 1 and Layer 2 both fail, OR state not yet integrated,
+             OR the farmer explicitly switches to manual map upload after
+             rejecting an auto-fetched boundary.
   How it works:
   App shows the farmer step-by-step instructions to download their land
   map from the government portal and upload it as an image.
@@ -1357,7 +1366,9 @@ LandListScreen
            - Farm name
            - Survey number
            - Area in acres
-           - Status badge: Verified / Pending / Rejected
+          - Verification badge: Verified
+          - Audit status text or chip: No audit yet / Audit due /
+            Processing / Complete
            - Last audit year, or "No audit yet"
            - "Start Audit" button when the parcel is verified and there is
              no completed audit for the current audit year
@@ -1395,7 +1406,9 @@ BoundaryConfirmScreen
     - Switch to manual map upload
     - Retake the original document photo
 
-ManualUploadGuideScreen (shown only when Layers 1+2 fail)
+ManualUploadGuideScreen (shown when Layers 1+2 fail, or when the farmer
+                         explicitly chooses manual map upload after rejecting
+                         an auto-fetched boundary)
   Alternate Step 2 of 3 when automatic boundary retrieval fails.
   Shows four numbered instruction cards for downloading the official map from
   the government portal, then returning to the app and uploading it.
@@ -1405,7 +1418,8 @@ LandDetailScreen
   Detailed parcel hub opened from HomeScreen or LandListScreen.
   Top section: large satellite image for the parcel using the cached GEE PNG.
   Details card: farm name, survey number, village, taluka, district,
-                area, boundary source, registration date, and status badge.
+                area, boundary source, registration date,
+                verification badge, and current audit state.
   Per-land audit history section: year, credits earned, and latest
                                   certificate link for each audit.
   Primary actions vary by state:
@@ -1414,7 +1428,9 @@ LandDetailScreen
     - View Latest Certificate when the current-year audit is complete
   Secondary actions:
     - Edit farm name
-    - Report boundary issue and restart land verification if needed
+  Note: Self-serve boundary replacement for an already registered parcel is
+        outside the TerraTrust v3.1 farmer app scope. Boundary disputes are
+        handled as an operator-support workflow.
 
 EditLandNameScreen
   Single-field rename flow for a parcel.
@@ -1443,6 +1459,13 @@ GET /api/v1/land/fetch-boundary
   Returns: {status:"success", boundary_source, geojson:{...}}
            or {status:"manual_required"}
 
+POST /api/v1/land/fetch-boundary
+  Accepts: multipart/form-data with map_image plus survey_number,
+           district, taluka, village, state
+  Purpose: Layer 3 manual-map processing after the farmer uploads a
+           downloaded government parcel map
+  Returns: {status:"success", boundary_source:"MANUAL", geojson:{...}}
+
 POST /api/v1/land/register
   Body: {farm_name, survey_number, district, taluka, village, state,
          boundary_source, geojson, ocr_owner_name}
@@ -1470,8 +1493,12 @@ Species only. It does NOT measure height as primary source.
 
 HEIGHT SOURCE PRIORITY:
   Primary: NASA GEDI satellite rh98 canopy height (from space).
-  Fallback: AR anchor height (farmer taps base, tilts to top) — used
-            only when GEDI has no laser footprint at that GPS location.
+  Planning rule: GET /api/v1/audit/zones determines gedi_available for
+                 each sampling zone before scanning starts.
+  Primary use: Backend uses the nearest valid GEDI rh98 sample inside a
+               GEDI-enabled zone for trees scanned in that zone.
+  Fallback: AR anchor height (farmer taps base, tilts to top) — used for
+            every tree in zones where gedi_available=false.
   This was changed from v2.x where AR measured height as the primary
   method. GEDI is more consistent and eliminates farmer measurement error.
 
@@ -1487,8 +1514,10 @@ Process (runs when farmer taps "Start Audit"):
        Low density:    NDVI < 25th percentile
        Medium density: NDVI between 25th and 75th percentile
        High density:   NDVI > 75th percentile
-  4. Backend finds the centroid of each zone cluster.
-  5. Calculates plot radius based on land area:
+      4. Backend classifies the parcel into three vegetation-density bands
+      (high / medium / low NDVI) and allocates 2-8 sampling circles across
+      those bands based on acreage.
+      5. Calculates plot radius based on land area:
        Area ≤ 0.4 ha (≤1 acre):   radius = 7 metres per zone
        Area ≤ 1.2 ha (≤3 acres):  radius = 9 metres per zone
        Area > 1.2 ha (>3 acres):  radius = 11 metres per zone
@@ -1505,11 +1534,12 @@ Zone count by farm size:
   3 to 10 acres:   4-6 zones
   Above 10 acres:  6-8 zones (split into 2 sessions on separate days)
 
-Farmer scans every tree inside the zone radius circle.
-Minimum trees required: 3 trees per zone. Total minimum: 9 trees.
+Farmer scans every returned zone radius circle.
+Minimum trees required: 3 trees per returned zone.
+API field min_trees_required = 3 x generated zone count.
 Maximum trees: 5 trees per zone (stop and move to next zone after 5).
-If fewer than 3 eligible trees in a zone: zone marked low-density and
-backend uses satellite data alone for that zone's estimate.
+Sparse parcel portions that do not receive a sampling circle are handled by
+the satellite fusion engine and do not create extra scan obligations.
 
 7.3 THE 3-TIER AR MEASUREMENT SYSTEM
 --------------------------------------
@@ -1590,8 +1620,11 @@ Process:
   TFLite model runs inference on-device (~200ms).
   Result shown: "Teak (Tectona grandis) — 87% confident"
 
-  If confidence ≥ 60%: Accept the result. Show confirmation.
-  If confidence < 60%: Show dropdown for manual selection from species list.
+  If approved species confidence ≥ 80%: Auto-accept.
+  If approved species confidence is between 60% and 79%: Show
+  confirmation UI ("Is this correct?") before accepting.
+  If approved species confidence < 60%, or the top label is NOT_APPROVED:
+  Show dropdown for explicit manual selection from the approved species list.
   If selected species not in approved list: "This species is not eligible
   for carbon credits. Please scan a different tree."
 
@@ -1622,9 +1655,15 @@ Approved Species and Wood Density Values (rho in g/cm³):
   treat "Indian Rosewood", "Shisham", and "North Indian Rosewood" as display
   aliases for Dalbergia sissoo only.
   Species model acceptance rule:
-  Accept the detected species only when the top prediction is one of the
-  11 approved species and species_confidence >= 0.80. Otherwise show
-  "not approved" / "retake photo" and block scan submission.
+  The mobile app must submit a species_source field for every tree:
+    MODEL_AUTO      = top approved label with species_confidence >= 0.80
+    MODEL_CONFIRMED = top approved label with 0.60 <= species_confidence < 0.80
+                      and explicit farmer confirmation
+    MANUAL_SELECTED = farmer explicitly chose an approved label after a
+                      low-confidence or NOT_APPROVED model result
+  The backend accepts only approved species labels and validates that
+  species_source is consistent with species_confidence. The app must never
+  submit NOT_APPROVED as the saved species label.
   TFLite model contract:
   Input = RGB image, 224x224, normalized to [0,1]. Output = 12 labels in
   fixed order: the 11 approved species above plus NOT_APPROVED. Store the
@@ -1723,15 +1762,18 @@ SCREEN: AuditCompleteScreen
     was collected before submission.
   Button: "Submit for Satellite Verification"
   On submit:
+    Disable the submit button immediately to prevent double taps.
     All tree data + GPS + evidence photos uploaded to backend.
     SHA-256 hash of each photo computed before upload.
     Loading screen: "Calculating your carbon credits using satellite
     data... This usually takes 30-60 seconds."
+    Re-submitting the same audit_id is safe but must not create duplicate
+    background jobs.
     Backend runs full satellite fusion (Celery task).
 
 SCREEN: AuditStatusScreen
   Purpose: Dedicated polling screen shown immediately after submit while the
-           backend remains in CALCULATING or minting-related states.
+           backend remains in PROCESSING, CALCULATING, or READY_TO_MINT.
   Shows while processing:
     Loading animation, farmer-friendly progress copy, audit year, parcel
     name, and step indicators:
@@ -1781,9 +1823,10 @@ Each tree scan, sent to backend and stored locally:
     "zone_id": "uuid",           // Sampling zone this tree belongs to
     "species": "Teak",
     "species_confidence": 0.91,  // 0.0 to 1.0
+    "species_source": "MODEL_AUTO",
     "dbh_cm": 22.4,
     "wood_density": 0.60,        // Auto-looked up from species table
-    "ar_height_m": 11.5,         // null if GEDI is available
+    "ar_height_m": 11.5,         // null when gedi_available=true for the zone
     "measurement_tier": 1,       // 1, 2, or 3
     "confidence_score": 0.87,    // RANSAC fit confidence (null for Tier 3)
     "gps_lat": 18.546,
@@ -1803,13 +1846,14 @@ GET /api/v1/audit/zones?land_id=[uuid]
 
 POST /api/v1/audit/submit-samples
   Body: {land_id, audit_id, trees:[...array of tree scan payloads...]}
-  Returns: {status:"processing", audit_id, estimated_seconds:60}
+  Returns: {status:"PROCESSING", audit_id, estimated_seconds:60}
 
 GET /api/v1/audit/result/{audit_id}
-  Returns: {status:"CALCULATING"} while processing, then:
+  Returns: {status:"PROCESSING"} OR {status:"CALCULATING"} OR
+           {status:"READY_TO_MINT"} while non-terminal, then:
            {status:"MINTED", total_biomass_tonnes, credits_issued,
             tx_hash, ipfs_certificate_url, audit_year}
-  Polling: App polls every 5 seconds until status is not "CALCULATING".
+  Polling: App polls every 5 seconds until status is terminal.
 
 
 ================================================================================
@@ -1983,16 +2027,18 @@ GEE code:
       .rename('GEDI_HEIGHT')
 
 Height selection logic (Python, per scanned tree):
-  def get_tree_height(scan, gedi_image):
-      gedi_value = gedi_image.sample(
-          region=ee.Geometry.Point([scan['gps']['lng'], scan['gps']['lat']]),
-          scale=25
-      ).first().getInfo()
+  def get_tree_height(scan, zone_geometry, gedi_image):
+    gedi_value = gedi_image.sample(
+      region=zone_geometry,
+      scale=25,
+      numPixels=1,
+      geometries=False
+    ).first().getInfo()
 
-      if gedi_value and gedi_value['properties']['GEDI_HEIGHT'] > 0:
-          return gedi_value['properties']['GEDI_HEIGHT'], 'GEDI'
-      else:
-          return scan['height_m'], 'AR_FALLBACK'
+    if gedi_value and gedi_value['properties']['GEDI_HEIGHT'] > 0:
+      return gedi_value['properties']['GEDI_HEIGHT'], 'GEDI'
+    else:
+      return scan['height_m'], 'AR_FALLBACK'
 
 8.7 LAYER 5 — SRTM TOPOGRAPHY (Terrain Correction)
 ----------------------------------------------------
@@ -2253,7 +2299,8 @@ A farm with the same biomass as last year earns zero credits.
       # CO2 equivalent: 1 tonne carbon = 44/12 = 3.667 tonnes CO2
       co2_equivalent = carbon_tonnes * 3.667
 
-      # 1 CTT token = 1 tonne CO2 equivalent
+      # credits_issued is the human-readable CTT amount.
+      # Minting converts it to integer deci-CTT units on-chain.
       credits_issued = co2_equivalent
 
       return {
@@ -2421,9 +2468,9 @@ Contract code:
       function mintAudit(
           address farmer,         // Farmer's wallet address (0x...)
           uint256 auditId,        // Unique audit ID using uuid.UUID(audit_id).int
-          uint256 creditAmount,   // Number of CTT to mint (e.g. 12)
-                                  // CRITICAL: Send actual number, NOT *10^18
-                                  // Old bug: was multiplied by 10^18 → FIXED
+          uint256 creditAmount,   // Integer deci-CTT units (e.g. 124 = 12.4 CTT)
+                      // Backend multiplies displayed CTT by 10
+                      // CRITICAL: Do NOT use 10^18 scaling
           string memory ipfsHash, // "ipfs://CID..." — evidence package link
           string memory landId,   // Internal land UUID as string
           uint256 auditYear       // e.g. 2026
@@ -2606,8 +2653,8 @@ the background only for validation using a dedicated frontend-safe RPC key.
           provider
       );
       // Token ID 1 = Carbon Credit tokens
-      const balance = await contract.balanceOf(walletAddress, 1);
-      return Number(balance); // Returns whole number of CTT tokens
+        const rawBalance = await contract.balanceOf(walletAddress, 1);
+        return Number(rawBalance) / 10; // raw chain units are tenths of a CTT
   };
 
 
@@ -2632,13 +2679,13 @@ SCREEN: HomeScreen
       Title row: "My Lands" with "View All" action that switches to the
       My Lands tab.
       Preview list of registered land parcels. Each card shows:
-        GEE Sentinel-2 PNG thumbnail, Farm name, Area, Status badge.
-      Status colours:
-        Green = Verified and already has a completed audit for the current
-                calendar audit_year
-        Orange = Verified, no completed audit exists yet for the current
-                 calendar audit_year, and the recommended audit window is open
-        Red = Overdue by more than 3 months
+        GEE Sentinel-2 PNG thumbnail, Farm name, Area,
+        Verification badge, and audit status text.
+      Audit status examples:
+        Complete = completed audit exists for the current calendar audit_year
+        Audit due = no completed audit exists yet for the current audit_year
+        Processing = current-year audit is PROCESSING, CALCULATING,
+                     or READY_TO_MINT
       Tapping the card body opens LandDetailScreen.
       "Start Audit" button on orange/red cards only when no current-year
       audit exists. Otherwise show "View Status" or "Resume Audit".
@@ -2724,6 +2771,9 @@ SCREEN: MaintenanceScreen
   Trigger:
     GET /api/v1/status or any farmer-facing API response indicates
     maintenance mode.
+  While shown:
+    Poll GET /api/v1/status every 10 seconds and dismiss automatically once
+    maintenance=false.
 
 ================================================================================
 SECTION 11: DATABASE SCHEMA (SUPABASE / POSTGRESQL + POSTGIS)
@@ -2883,11 +2933,13 @@ Purpose: Individual tree measurements from AR scanning sessions.
       gps_location     GEOMETRY(POINT, 4326) NOT NULL,
       species          VARCHAR(100) NOT NULL,
       species_confidence FLOAT CHECK (species_confidence BETWEEN 0 AND 1),
+      species_source   VARCHAR(20) NOT NULL,
+      -- 'MODEL_AUTO', 'MODEL_CONFIRMED', or 'MANUAL_SELECTED'
       dbh_cm           FLOAT NOT NULL CHECK (dbh_cm > 0 AND dbh_cm < 500),
       height_m         FLOAT,
       -- AR-measured height. NULL if GEDI data was used instead.
       gedi_height_m    FLOAT,
-      -- GEDI rh98 height at this location. NULL if no footprint.
+      -- GEDI rh98 height resolved for this tree from the current zone.
       height_source    VARCHAR(20),
       -- 'GEDI' or 'AR_FALLBACK'
       wood_density     FLOAT NOT NULL,
@@ -2952,7 +3004,8 @@ Purpose: One record per annual audit per land parcel.
       delta_biomass        FLOAT, -- Growth = current - previous
       carbon_tonnes        FLOAT, -- delta * 0.47 (IPCC carbon fraction)
       co2_equivalent       FLOAT, -- carbon * 3.667 (CO2 conversion)
-      credits_issued       FLOAT, -- = co2_equivalent (1 CTT = 1 tonne CO2e)
+      credits_issued       FLOAT, -- Human-readable CTT amount (1 CTT = 1 tonne CO2e)
+                -- On-chain raw units = credits_issued * 10
       trees_scanned_count  INT,
 
       -- Blockchain records
@@ -3090,7 +3143,9 @@ GET /api/v1/auth/me
               "phone_number": "+91XXXXXXXXXX",
               "full_name": "Ramesh Shankar Patil",
               "kyc_completed": true,
-              "wallet_address": "0x..."
+              "wallet_address": "0x...",
+              "wallet_recovery_status": null,
+              "wallet_recovery_requested_at": null
             }
 
 POST /api/v1/auth/kyc
@@ -3160,6 +3215,24 @@ GET /api/v1/land/fetch-boundary
             }
   Fallback: { "status": "manual_required" }
 
+POST /api/v1/land/fetch-boundary
+  Purpose:  Layer 3 manual-map processing variant used by
+            ManualUploadGuideScreen after the farmer uploads a downloaded
+            government land map image.
+  Request:  multipart/form-data
+              map_image: [downloaded map image — JPG or PNG, max 10MB]
+              survey_number: "47"
+              district: "Pune"
+              taluka: "Haveli"
+              village: "Kharadi"
+              state: "Maharashtra"
+  Process:  Extract polygon edges from the uploaded map image using OpenCV,
+            validate the polygon, generate the same Sentinel-2 thumbnail, and
+            return the standard boundary payload with boundary_source='MANUAL'.
+  Response: Same success payload as GET /api/v1/land/fetch-boundary,
+            but with "boundary_source": "MANUAL".
+  Error 422: { "error": "Could not extract a valid parcel boundary from the uploaded map." }
+
 POST /api/v1/land/register
   Purpose:  Save confirmed boundary after farmer taps "Yes this is my land".
   Request:  {
@@ -3189,8 +3262,10 @@ GET /api/v1/land/list
   Query:    page=1, limit=20
   Response: {
               "items": [{ "id", "farm_name", "survey_number",
+                           "district", "taluka", "village", "state",
                            "area_hectares", "is_verified",
                            "boundary_source", "last_audit_year",
+                           "registered_at",
                            "current_audit_id", "current_audit_status",
                            "thumbnail_url" }],
               "page": 1,
@@ -3228,6 +3303,11 @@ GET /api/v1/audit/zones
               "walking_path_metres": 145,
               "min_trees_required": 9
             }
+  Note:     Example above is a 3-zone parcel, so min_trees_required = 9.
+            gedi_available is determined per zone. When true, the backend
+            resolves height from the nearest valid GEDI sample inside that
+            zone and the app keeps height capture hidden. When false, the app
+            must collect AR height for every tree in that zone.
   Error 409: { "error": "An audit already exists for this land in the current audit year.",
                "existing_audit_id": "uuid",
                "status": "CALCULATING" }
@@ -3241,6 +3321,7 @@ POST /api/v1/audit/submit-samples
                 "zone_id": "uuid",
                 "species": "Teak",
                 "species_confidence": 0.91,
+                "species_source": "MODEL_AUTO",
                 "dbh_cm": 22.4,
                 "height_m": null,
                 "gps": { "lat": 18.5461, "lng": 73.9812 },
@@ -3252,20 +3333,32 @@ POST /api/v1/audit/submit-samples
                 "scan_timestamp": "2026-11-10T10:24:31Z"
               }]
             }
-  Process:  Validate min 9 trees.
-            Reject any tree with species_confidence < 0.80.
+  Process:  Validate minimum tree count.
+            Validate 3 trees for each generated zone
+            (min_trees_required = zone_count x 3).
+            Validate species according to species_source:
+              MODEL_AUTO      requires species_confidence >= 0.80
+              MODEL_CONFIRMED requires 0.60 <= species_confidence < 0.80
+              MANUAL_SELECTED requires species to be in the approved list
+                               even when model confidence is lower
             Reject any tree with gps_accuracy_m > 30.
             Verify evidence_photo_hash against the decoded, EXIF-stripped,
             final JPEG bytes provided in evidence_photo_base64.
             Store each scan → dispatch Celery task.
-  Response: { "status": "processing", "audit_id": "uuid",
+            Idempotency rule: if the same audit_id is submitted again while
+            still non-terminal, return the current processing response and do
+            not create duplicate background jobs. Terminal audits cannot be
+            resubmitted.
+  Response: { "status": "PROCESSING", "audit_id": "uuid",
               "estimated_seconds": 60 }
-  Error 400: { "error": "Minimum 9 trees required across all zones." }
+  Error 400: { "error": "Minimum [min_trees_required] trees required for this audit." }
 
 GET /api/v1/audit/result/{audit_id}
   Purpose:  Polling endpoint — returns current audit status.
-  Response (processing):
-            { "status": "CALCULATING" }
+  Response (non-terminal):
+            { "status": "PROCESSING" } OR
+            { "status": "CALCULATING" } OR
+            { "status": "READY_TO_MINT" }
   Response (complete, no credits):
             { "status": "COMPLETE_NO_CREDITS",
               "total_biomass_tonnes": 14.8,
@@ -3885,7 +3978,7 @@ Top-level navigation uses three navigator types from React Navigation v7:
        ManualUploadGuideScreen, LandRegistrationSuccessScreen,
        AuditStartScreen, ZoneNavigationScreen, ARCameraScreen,
        ManualMeasureScreen, TreeResultScreen, AuditCompleteScreen,
-       AuditStatusScreen, NotificationsScreen, WalletRecoveryScreen
+       AuditStatusScreen, NotificationsScreen
    - Maintenance override: MaintenanceScreen replaces all content when the
      backend signals maintenance mode
 
@@ -3912,8 +4005,7 @@ Top-level navigation uses three navigator types from React Navigation v7:
    - Audit flow: AuditStartScreen, ZoneNavigationScreen, ARCameraScreen,
      ManualMeasureScreen, TreeResultScreen, AuditCompleteScreen,
      AuditStatusScreen
-   - Utility modals: NotificationsScreen, WalletRecoveryScreen,
-     MaintenanceScreen
+   - Utility modals: NotificationsScreen, MaintenanceScreen
 
 Bottom tab visual specs:
   Active colour: Forest Green (#2F855A)
@@ -3942,7 +4034,7 @@ Header and back rules:
   No back button:
     HomeScreen, LandListScreen, CreditHistoryScreen when opened as the
     History-tab root, ProfileScreen, KYCScreen, AuditCompleteScreen,
-    AuditStatusScreen while CALCULATING.
+    AuditStatusScreen while the audit is non-terminal.
 
 Complete screen list:
   Auth: SplashScreen, LoginScreen, OTPScreen, KYCScreen, OnboardingScreen
@@ -4027,8 +4119,9 @@ Back navigation rules:
   confirmation before exiting the audit.
   AuditCompleteScreen does not allow returning to camera screens once review
   is underway.
-  AuditStatusScreen disables back navigation while CALCULATING; Android back
-  minimizes the app instead.
+  AuditStatusScreen disables back navigation while audit status is
+  PROCESSING, CALCULATING, or READY_TO_MINT; Android back minimizes the
+  app instead.
 
 Notification and deep-link routing:
   terratrust://audit/{audit_id} → AuditStatusScreen
@@ -4175,6 +4268,7 @@ backend/
 │   │                                 ← POST /api/v1/auth/register-wallet
 │   ├── land.py                       ← POST /api/v1/land/verify-document
 │   │                                 ← GET  /api/v1/land/fetch-boundary
+│   │                                 ← POST /api/v1/land/fetch-boundary (manual map)
 │   │                                 ← POST /api/v1/land/register
 │   │                                 ← GET  /api/v1/land/list
 │   ├── audit.py                      ← GET  /api/v1/audit/zones
@@ -4477,7 +4571,8 @@ Log:       Record failure with timestamp, state, district for monitoring.
 23.3 WMS GETFEATUREINFO FAILURE
 ---------------------------------
 Trigger:   BhuNaksha portal returns empty response, timeout, or HTTP error.
-Response:  Silently fallback to Layer 3 manual upload.
+Response:  Silently fallback to Layer 2 scraping.
+           If Layer 2 also fails, show Layer 3 manual upload.
            Log: state + district + taluka + survey_number + HTTP status code.
 Monitor:   If failure rate for a state exceeds 50% → remove from Tier 2 list.
 
@@ -4553,7 +4648,7 @@ Test files:
     - Chave equation: Teak 22.4cm DBH + 14.2m height → ~230 kg
     - Credit calc: delta_biomass = 0 → credits_issued = 0
     - Credit calc: negative delta → credits_issued = 0
-    - Credit calc: first year (no prev) → credits from full biomass
+    - Credit calc: first year (no prev) → baseline year, credits_issued = 0
 
   tests/test_land_boundary.py
     - gis_code construction with known Maharashtra values
@@ -4876,11 +4971,11 @@ APPENDIX A: ALIGNMENT CLARIFICATIONS (APRIL 2026)
 ────────────────────────────────────────────────
 1. Boundary reject path
   If the farmer rejects the displayed boundary, preserve the OCR-extracted
-  document fields and offer exactly two next actions:
+  document fields and offer exactly three next actions:
   a. "Try Automatic Fetch Again" → re-run GET /api/v1/land/fetch-boundary once.
   b. "Use Manual Map Upload" → navigate to ManualUploadGuideScreen.
-  Do not force the farmer to retake the original document photo unless they
-  explicitly choose "Try Again" from DocumentUploadScreen.
+  c. "Retake Document Photo" → return to DocumentUploadScreen.
+  Rejecting a boundary must not silently discard the OCR result.
 
 2. AuditStartScreen data sources
   Land name, area, last_audit_year, and current verification status come from
@@ -4903,12 +4998,15 @@ APPENDIX A: ALIGNMENT CLARIFICATIONS (APRIL 2026)
   Show a weak-signal warning when gps_accuracy_m > 20.
   Block saving a tree scan when gps_accuracy_m > 30.
 
-5. GEDI full-coverage fallback
-  If GEDI rh98 is null/0 for the entire land parcel, mark gedi_available=false
-  for every zone, show the height-measurement control for every tree, use
-  AR-measured height only for tree-level Chave calculations, and exclude the
-  GEDI feature from the parcel model for that audit.
-  features_count must reflect the reduced stack for that audit.
+5. GEDI zone fallback and parcel-wide fallback
+  GET /api/v1/audit/zones computes gedi_available per zone.
+  If gedi_available=true for a zone, hide height capture for that zone and
+  resolve tree height from the nearest valid GEDI sample inside that zone.
+  If gedi_available=false for a zone, show the height-measurement control for
+  every tree in that zone and use AR-derived height for those trees.
+  If every zone in the parcel has gedi_available=false, exclude the GEDI
+  feature from the parcel model for that audit and reduce features_count
+  accordingly.
 
 6. Backend rate limiting
   Minimum production limits:
@@ -4933,14 +5031,22 @@ APPENDIX A: ALIGNMENT CLARIFICATIONS (APRIL 2026)
   a. Farmer completes Firebase OTP and KYC re-verification on a new device.
   b. Backend verifies recovery eligibility against the existing user record.
   c. A replacement wallet is created on-device.
-  d. The backend executes a documented recovery workflow that reissues future
-    credits to the new wallet and records the old wallet as superseded.
-  e. Pre-launch contract scope must include a wallet-recovery mechanism for
-    balance migration and certificate continuity; without it, production
-    launch is blocked.
+  d. The backend executes a documented recovery workflow that rebinds future
+    credit issuance and future audit certificates to the new wallet and
+    records the old wallet as superseded.
+  e. Already-issued on-chain token balances and historical ERC-1155
+    certificate ownership remain at the original wallet in v3.1.
+  f. Pre-launch scope must include this admin workflow, explicit in-app
+    disclosure of the limitation above, and an operational approval SLA;
+    without that clarity, production launch is blocked.
 
 8. Aadhaar compliance rules
   The app may collect Aadhaar only for immediate KYC verification.
+  It is needed because OTP alone proves phone possession, while TerraTrust
+  also needs a one-time identity anchor for owner-name matching against the
+  7/12 land record and for wallet-recovery re-verification.
+  It is not used for satellite processing, biomass calculation, or normal
+  day-to-day app usage after KYC is complete.
   Plain Aadhaar must exist only in volatile memory during form submission.
   Backend must hash it immediately, never log it, never store images/scans of
   Aadhaar, and display only masked forms if shown back to the user.

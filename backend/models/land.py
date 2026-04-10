@@ -59,8 +59,14 @@ class LandListItem(BaseModel):
     id: str
     farm_name: str
     survey_number: str
+    district: str
+    taluka: str
+    village: str
+    state: str
     area_hectares: float
     is_verified: bool = True
+    boundary_source: str | None = None
+    registered_at: str | None = None
     last_audit_year: int | None = None
     current_audit_id: str | None = None
     current_audit_status: str | None = None

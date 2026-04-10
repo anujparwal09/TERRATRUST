@@ -107,6 +107,45 @@ def _sample_gedi_height(gedi_image: ee.Image, lat: float, lng: float) -> Optiona
         return None
 
 
+def _sample_zone_gedi_height(gedi_image: ee.Image, zone: Dict[str, Any]) -> Optional[float]:
+    """Resolve the nearest valid GEDI sample inside a scan-required zone."""
+    centre = zone.get("centre_gps") or {}
+    lat = centre.get("lat")
+    lng = centre.get("lng")
+    radius_metres = zone.get("radius_metres")
+
+    try:
+        lat = float(lat)
+        lng = float(lng)
+        radius_metres = float(radius_metres)
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        feature = gedi_image.sample(
+            region=ee.Geometry.Point([lng, lat]).buffer(radius_metres),
+            scale=25,
+            numPixels=1,
+            geometries=False,
+        ).first()
+        if feature is None:
+            return None
+
+        sample_info = feature.getInfo() or {}
+        properties = sample_info.get("properties", {})
+        value = properties.get("GEDI_RH98")
+        if value is None:
+            value = properties.get("GEDI_HEIGHT")
+
+        if value is None:
+            return None
+
+        height = float(value)
+        return height if height > 0 else None
+    except Exception:
+        return None
+
+
 def _image_has_valid_pixels(image: ee.Image, region: ee.Geometry, scale: int) -> bool:
     """Return whether an Earth Engine image has any unmasked pixels in a region."""
     stats = image.reduceRegion(
@@ -127,6 +166,7 @@ def run_fusion(
     tree_scans: List[Dict[str, Any]],
     land_boundary_geojson: Dict[str, Any],
     audit_year: int,
+    sampling_zones: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run the multi-source data fusion and biomass estimation.
 
@@ -221,8 +261,20 @@ def run_fusion(
         .mean()
         .rename("GEDI_RH98")
     )
-    gedi_available = _image_has_valid_pixels(raw_gedi, region, scale=25)
-    gedi = raw_gedi.unmask(0) if gedi_available else None
+    zone_lookup: Dict[str, Dict[str, Any]] = {}
+    if sampling_zones:
+        zone_lookup = {
+            str(zone.get("id") or zone.get("zone_id")): zone
+            for zone in sampling_zones
+            if zone.get("id") or zone.get("zone_id")
+        }
+
+    if zone_lookup:
+        gedi_feature_enabled = any(bool(zone.get("gedi_available")) for zone in zone_lookup.values())
+    else:
+        gedi_feature_enabled = _image_has_valid_pixels(raw_gedi, region, scale=25)
+
+    gedi = raw_gedi.unmask(0) if gedi_feature_enabled else None
 
     # -----------------------------------------------------------------------
     # 5. SRTM elevation & slope
@@ -251,6 +303,7 @@ def run_fusion(
     training_points: List[ee.Feature] = []
     tree_measurements: List[Dict[str, Any]] = []
     skipped_scans = 0
+    zone_height_cache: Dict[str, Optional[float]] = {}
 
     for scan in tree_scans:
         species = normalise_species_name(scan.get("species", ""))
@@ -264,8 +317,15 @@ def run_fusion(
             )
             continue
 
+        zone_id = str(scan.get("zone_id") or "")
+        zone = zone_lookup.get(zone_id)
+
         gedi_height_m = scan.get("gedi_height_m")
-        if gedi_height_m is None and gedi_available:
+        if zone and zone.get("gedi_available"):
+            if zone_id not in zone_height_cache:
+                zone_height_cache[zone_id] = _sample_zone_gedi_height(raw_gedi, zone)
+            gedi_height_m = zone_height_cache.get(zone_id)
+        elif gedi_height_m is None and not zone_lookup and gedi_feature_enabled:
             gedi_height_m = _sample_gedi_height(raw_gedi, lat, lng)
 
         height_m = gedi_height_m if gedi_height_m is not None else scan.get("height_m")
@@ -385,7 +445,7 @@ def run_fusion(
             "features_count": len(band_names),
             "processing_method": (
                 "S1_S2_GEDI_SRTM_XGBoost_v3.1"
-                if gedi_available
+                if gedi_feature_enabled
                 else "S1_S2_SRTM_XGBoost_v3.1"
             ),
         },

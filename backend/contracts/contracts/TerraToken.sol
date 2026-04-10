@@ -35,7 +35,8 @@ contract TerraTrustToken is ERC1155, Ownable {
     constructor() ERC1155("") Ownable(msg.sender) {}
 
     /**
-     * @notice Documented parameter order from the v3.1 backend spec.
+        * @notice Documented parameter order from the v3.1 backend spec.
+        *         ``creditAmount`` uses raw deci-CTT units (e.g. 124 = 12.4 CTT).
      */
     function mintAudit(
         address farmer,

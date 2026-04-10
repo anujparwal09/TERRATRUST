@@ -228,8 +228,7 @@ Modal flows above tabs:
   - Annual audit: AuditStartScreen, ZoneNavigationScreen, ARCameraScreen,
     ManualMeasureScreen, TreeResultScreen, AuditCompleteScreen,
     AuditStatusScreen.
-  - Utility modals: NotificationsScreen, WalletRecoveryScreen,
-    and MaintenanceScreen.
+  - Utility modals: NotificationsScreen and MaintenanceScreen.
 
 Tab bar behavior:
   - Visible throughout normal browsing inside the tab stacks.
@@ -246,7 +245,8 @@ Header and back-navigation rules:
     ZoneNavigationScreen, and MaintenanceScreen use custom or no system header.
   - HomeScreen uses a bell icon as the right-side header action.
   - KYCScreen, AuditCompleteScreen after review begins, and AuditStatusScreen
-    while CALCULATING do not allow navigating back into the previous flow.
+    while the audit is non-terminal do not allow navigating back into the
+    previous flow.
 
 ================================================================================
 SECTION 2: FOLDER STRUCTURE
@@ -392,8 +392,9 @@ app never talks directly to Supabase from the device.
 
 KYC (Aadhaar + Name) is collected once at first login. The name collected here
 is later cross-checked against the owner name extracted from their 7/12 land
-document by OCR. They must match exactly, otherwise land registration is
-rejected.
+document by OCR. The farmer should enter it as written on the document, but
+backend validation uses fuzzy matching (>=80% similarity) to tolerate OCR and
+spacing differences. Below that threshold, land registration is rejected.
 
 When a new farmer logs in for the first time and has no wallet address on
 record, the app silently generates a blockchain wallet. The farmer sees nothing
@@ -449,6 +450,13 @@ SCREEN: KYCScreen
   Why this matters:  The name entered here is matched against the OCR-extracted
                      owner name from the land document in Module 2. Mismatch
                      blocks land registration.
+  Why Aadhaar is collected:
+                     OTP proves control of the phone number, but not the
+                     farmer's real-world identity. TerraTrust uses Aadhaar in
+                     v3.1 as the one-time KYC identifier so the backend can
+                     bind the account to a farmer identity, compare that KYC
+                     name against the 7/12 owner name, and re-verify the same
+                     person during wallet recovery.
   On submit:         POST /api/v1/auth/kyc to backend over HTTPS with the raw
                      Aadhaar number. Backend hashes Aadhaar with SHA-256 before
                      storage (never stored plain text) and saves only the hash
@@ -558,7 +566,9 @@ LAYER 2 — Web Scraping Fallback
 
 LAYER 3 — Manual Guided Upload (Last Resort)
   How it works:
-  If both Layer 1 and Layer 2 fail, the app shows the ManualUploadGuideScreen.
+  If both Layer 1 and Layer 2 fail, or the farmer explicitly switches to
+  manual map upload after rejecting an auto-fetched boundary, the app shows
+  the ManualUploadGuideScreen.
   This screen guides the farmer step by step to download their own map from the
   government portal and upload it.
   Steps shown to farmer:
@@ -586,8 +596,9 @@ SCREEN: LandListScreen
   What farmer sees:  A list of their registered land parcels. Each card shows:
                      - Farm name (e.g., "North Field" — editable by farmer)
                      - Area in acres
-                     - Status badge: Verified (green), Pending (orange),
-                       Rejected (red)
+                     - Verification badge: Verified (green)
+                     - Audit status text or chip: No audit yet, Audit due,
+                       Processing, or Complete
                      - Last audit year
                      - "Start Audit" button only when the parcel is verified
                        and no completed audit exists for the current audit year
@@ -649,34 +660,39 @@ SCREEN: BoundaryConfirmScreen
   On confirm:        GeoJSON polygon submitted to backend. Backend stores it
                      in Supabase PostGIS under the authenticated farmer's
                      user ID. Land status set to Verified.
-                     Navigate back to LandListScreen. New land shown as
-                     Verified.
-  On reject:         Preserve the OCR-extracted document fields and offer two
-                     actions: "Try Automatic Fetch Again" or
-                     "Use Manual Map Upload". Only navigate back to
-                     DocumentUploadScreen if the farmer explicitly chooses to
-                     retake the original document photo.
+                     Navigate to LandRegistrationSuccessScreen.
+  On reject:         Preserve the OCR-extracted document fields and offer
+                     three actions: "Try Automatic Fetch Again",
+                     "Use Manual Map Upload", or "Retake Document Photo".
 
 SCREEN: ManualUploadGuideScreen
-  Shown only when:   Layer 1 and Layer 2 both fail.
+  Shown when:        Layer 1 and Layer 2 both fail, or the farmer explicitly
+                     chooses manual map upload after rejecting an
+                     auto-fetched boundary.
   What farmer sees:  Step-by-step instructions with screenshots to download
                      their map from government portal.
                      Progress indicator: Step 1, Step 2, Step 3, Step 4.
                      Upload button at bottom.
-  After upload:      Same processing as Layer 2. Leads to BoundaryConfirmScreen.
+  After upload:      Calls the documented manual-map processing variant of
+                     POST /api/v1/land/fetch-boundary and then leads to
+                     BoundaryConfirmScreen on success.
 
 SCREEN: LandDetailScreen
   What farmer sees:  Full parcel detail view with:
                      - Large top satellite image for the parcel
                      - Parcel facts card (survey number, village, taluka,
                        district, area, boundary source, registration date)
-                     - Status badge and current audit state
+                     - Verification badge and current audit state
                      - Audit history for this parcel only
                      - Primary actions for Start Audit, View Audit Status,
                        View Latest Certificate, and Edit Farm Name
-                     - Secondary action to report a boundary issue and restart
-                       the land-verification flow if needed
   Entry points:      HomeScreen land card tap and LandListScreen land card tap.
+
+  Note:              Self-serve boundary replacement for an already
+                     registered parcel is outside the TerraTrust v3.1 farmer
+                     app scope. Boundary disputes are handled through
+                     operator support, not an in-app parcel re-registration
+                     action.
 
 SCREEN: EditLandNameScreen
   What farmer sees:  Single text input pre-filled with the current farm name.
@@ -716,12 +732,14 @@ Before the farmer starts walking, the backend:
 1. Fetches Sentinel-2 optical satellite imagery for the farm boundary.
 2. Calculates NDVI (Normalized Difference Vegetation Index) for every pixel
    inside the boundary.
-3. Identifies 3 distinct vegetation density zones: high density, medium
-   density, low density — based on NDVI value clustering.
-4. Places one sampling point at the centre of each zone.
-5. Calculates a linear walking path through all 3 zone points (shortest route
-   through all points, like a transect).
-6. Returns GPS coordinates of the 3 zone centres to the app.
+3. Classifies the parcel into three vegetation-density bands: high density,
+  medium density, and low density.
+4. Allocates 2-8 sampling circles across those density bands depending on
+  farm size.
+5. Places one sampling point at the centre of each returned zone.
+6. Calculates a linear walking path through all returned zone points
+  (shortest route through all points, like a transect).
+7. Returns GPS coordinates of the zone centres to the app.
 
 The number of zones and the plot radius scale with farm size:
   Up to 1 acre:    2-3 zones, 7 metre radius per zone
@@ -730,10 +748,11 @@ The number of zones and the plot radius scale with farm size:
   Above 10 acres:  6-8 zones, 11 metre radius, split into 2 sessions on
                    different days. Progress saved between sessions.
 
-Farmer scans every tree inside the zone radius (shown as a circle on map).
-Minimum 3 trees per zone. Maximum 5 trees per zone. If fewer than 3 eligible
-trees exist in a zone, the zone is marked as low-density and the algorithm
-uses satellite data alone for that zone's biomass estimate.
+Farmer scans every returned zone radius (shown as a circle on map).
+Minimum 3 trees per returned zone. Maximum 5 trees per zone.
+min_trees_required from the backend equals 3 x generated zone count.
+Sparse parcel portions that do not receive a sampling circle are handled by
+the satellite fusion engine and do not create extra scan obligations.
 
 5.3 THE 3-TIER AR MEASUREMENT SYSTEM
 --------------------------------------
@@ -863,11 +882,10 @@ SCREEN: ARCameraScreen
                      2. "Measure Diameter" — triggers Tier 1, 2, or 3 based
                         on detected tier. For Tier 3 this opens
                         ManualMeasureScreen.
-                     3. "Measure Height" — shown only when GEDI has no data
-                        for this location (backend flags this during zone
-                        generation). Uses AR anchor method: farmer taps base
-                        of tree, then taps top. Height = vertical distance
-                        between anchors.
+                3. "Measure Height" — shown only when gedi_available=false
+                  for the current zone. Uses AR anchor method: farmer
+                  taps base of tree, then taps top. Height = vertical
+                  distance between anchors.
   Progress counter:  Top-right corner shows: "3/9 trees scanned"
 
 SPECIES IDENTIFICATION FLOW:
@@ -875,7 +893,12 @@ SPECIES IDENTIFICATION FLOW:
   App captures still frame from camera.
   TensorFlow Lite model runs on-device (no internet needed).
   Result shown as overlay: "Teak (Tectona grandis) — 87% confident"
-  If confidence is below 60%:
+  If approved species confidence >= 80%:
+    Auto-accept the label.
+  If approved species confidence is between 60% and 79%:
+    Show confirmation UI: "Is this correct?" with Yes/No.
+  If approved species confidence is below 60%, or the top label is
+  NOT_APPROVED:
     Show dropdown list of approved species for manual selection.
   If species is not in approved list:
     Show error: "This species is not eligible for carbon credits. Please scan
@@ -929,10 +952,14 @@ SCREEN: AuditCompleteScreen
                        satellite verification")
                      Large button: "Submit for Satellite Verification"
   On submit:         All tree data + GPS locations + evidence photos uploaded
+                     after disabling the button immediately to prevent
+                     duplicate taps.
                      to backend. SHA-256 hash of each photo computed before
                      upload and stored.
                      Loading screen: "Calculating your carbon credits using
                      satellite data... This takes about 30-60 seconds."
+                     Re-sending the same audit_id is safe but must not create
+                     duplicate backend jobs.
                      Backend runs full satellite fusion (Sentinel-1, Sentinel-2,
                      GEDI, NISAR, SRTM, XGBoost model).
   On completion:     Navigate to AuditStatusScreen. Final success or no-credit
@@ -941,7 +968,7 @@ SCREEN: AuditCompleteScreen
 
 SCREEN: AuditStatusScreen
   What farmer sees:  Dedicated post-submit status screen.
-                     While CALCULATING:
+                     While status is PROCESSING / CALCULATING / READY_TO_MINT:
                        - loading animation
                        - parcel name and audit year
                        - farmer-friendly progress text
@@ -995,17 +1022,16 @@ MIDDLE SECTION — My Lands:
   Title row: "My Lands" with "View All" action switching to the My Lands tab.
   List of registered land parcels.
   Each card shows: Thumbnail satellite image of land (GEE Sentinel-2 PNG,
-  fetched once from backend and cached locally), Name, Area, Status.
-  Status colours:
-    Green = Verified and already has a completed audit for the current
-            calendar audit_year
-    Orange = Verified, no completed audit exists yet for the current
-             calendar audit_year, and the recommended audit window is open
-    Red = Overdue by more than 3 months
+  fetched once from backend and cached locally), Name, Area,
+  Verification badge, and audit status text.
+  Audit status examples:
+    Complete = completed audit exists for the current calendar audit_year
+    Audit due = no completed audit exists yet for the current audit_year
+    Processing = current-year audit is PROCESSING, CALCULATING,
+                 or READY_TO_MINT
   Tapping the card body opens LandDetailScreen.
-  "Start Audit" quick-action button on orange/red cards only when no
-  current-year audit exists. Otherwise show "View Status" or
-  "Resume Audit".
+  "Start Audit" quick-action button appears when no current-year audit
+  exists. Otherwise show "View Status" or "Resume Audit".
   Empty state: "You haven't registered any land yet" with
                "Register Your First Land" CTA.
 
@@ -1043,8 +1069,13 @@ SettingsScreen:
 WalletRecoveryScreen:
   Explains the admin-assisted wallet rotation flow. After OTP + KYC
   re-verification on a new device, the app creates a replacement wallet
-  locally and submits a recovery request to the backend.
-  UI includes warning card, plain-language recovery steps, and primary CTA.
+  locally and submits a recovery request to the backend. Future TerraTrust
+  credit issuance moves to the new wallet after approval; already-issued
+  on-chain balances remain at the original wallet in v3.1.
+  UI includes warning card, plain-language recovery steps, primary CTA, and
+  current request state when GET /api/v1/auth/me returns
+  wallet_recovery_status. When wallet_recovery_status='PENDING', disable the
+  CTA and show a pending badge plus submitted timestamp.
 
 NotificationsScreen:
   Shows in-app notifications for audit processing, credits minted,
@@ -1058,6 +1089,8 @@ MaintenanceScreen:
   response indicates maintenance mode.
   Shows TerraTrust logo, maintenance message, reassurance that data is safe,
   Play Store update CTA, and app version.
+  While visible, the app polls GET /api/v1/status every 10 seconds and
+  removes the screen automatically once maintenance=false.
 
 6.2 SCREEN: CreditHistoryScreen
 ---------------------------------
@@ -1247,7 +1280,9 @@ GET /api/v1/auth/me
                   phone_number: string,
                   full_name: string | null,
                   kyc_completed: boolean,
-                  wallet_address: string | null
+                  wallet_address: string | null,
+                  wallet_recovery_status: 'PENDING' | 'APPROVED' | 'REJECTED' | null,
+                  wallet_recovery_requested_at: string | null
                 }
 
 POST /api/v1/auth/kyc
@@ -1285,6 +1320,14 @@ GET /api/v1/land/fetch-boundary
                 }
                 or { status: 'manual_required' } if all layers fail
 
+POST /api/v1/land/fetch-boundary
+  Called when:  Farmer uploads a downloaded parcel map from
+                ManualUploadGuideScreen.
+  Sends:        multipart/form-data with map_image, survey_number, district,
+                taluka, village, state
+  Receives:     Same success payload as GET /api/v1/land/fetch-boundary,
+                with boundary_source: 'MANUAL'
+
 POST /api/v1/land/register
   Called when:  Farmer confirms boundary on BoundaryConfirmScreen.
   Sends:        {
@@ -1305,7 +1348,9 @@ GET /api/v1/land/list
   Sends:        page, limit
   Receives:     {
                   items: Array of { id, farm_name, survey_number,
-                    area_hectares, is_verified, last_audit_year,
+                    district, taluka, village, state,
+                    area_hectares, is_verified, boundary_source,
+                    registered_at, last_audit_year,
                     current_audit_id, current_audit_status, thumbnail_url },
                   page: number,
                   limit: number,
@@ -1341,6 +1386,7 @@ POST /api/v1/audit/submit-samples
                       zone_id: UUID,
                       species: string,
                       species_confidence: number,
+                      species_source: 'MODEL_AUTO' | 'MODEL_CONFIRMED' | 'MANUAL_SELECTED',
                       dbh_cm: number,
                       height_m: number | null,       // null = use GEDI
                       gps: { lat: number, lng: number },
@@ -1353,11 +1399,16 @@ POST /api/v1/audit/submit-samples
                     }
                   ]
                 }
-  Receives:     { status: 'processing', audit_id: UUID, estimated_seconds: 60 }
+  Receives:     { status: 'PROCESSING', audit_id: UUID, estimated_seconds: 60 }
+  Note:         Submit is idempotent per audit_id. Re-sending the same
+                audit_id while it is still non-terminal returns the same
+                processing result and must not create duplicate jobs.
 
 GET /api/v1/audit/result/{audit_id}
   Called when:  Polling every 5 seconds after submission.
-  Receives (processing):  { status: 'CALCULATING' }
+  Receives (non-terminal): { status: 'PROCESSING' } or
+                            { status: 'CALCULATING' } or
+                            { status: 'READY_TO_MINT' }
   Receives (no credits):  {
                             status: 'COMPLETE_NO_CREDITS',
                             total_biomass_tonnes: number,
@@ -1410,7 +1461,9 @@ GET /api/v1/credits/balance
                 using a dedicated frontend-safe ALCHEMY_POLYGON_AMOY_URL and
                 CONTRACT_ADDRESS. The displayed source of truth is always
                 balance_ctt from this response; the direct chain read is only
-                background validation. If the direct chain read fails, keep
+                background validation. Any direct chain validation must divide
+                raw ERC-1155 balance units by 10 because the contract stores
+                integer deci-CTT units. If the direct chain read fails, keep
                 showing balance_ctt from the API.
 
 ================================================================================
@@ -1905,14 +1958,21 @@ APPENDIX A: ALIGNMENT CLARIFICATIONS (APRIL 2026)
 
 1. Boundary reject flow
   Rejecting a boundary does not discard the OCR result. The screen must offer
-  "Try Automatic Fetch Again" and "Use Manual Map Upload". Returning to the
-  original document capture flow is a separate explicit choice.
+  "Try Automatic Fetch Again", "Use Manual Map Upload", and
+  "Retake Document Photo". Returning to the original document capture flow is
+  always an explicit choice.
 
 2. Species model contract
   The on-device TFLite model uses RGB 224x224 input and outputs the 11
-  approved species plus NOT_APPROVED. Accept a species only when the top
-  approved label has species_confidence >= 0.80. Otherwise block submission
-  and prompt the farmer to retake the species photo.
+  approved species plus NOT_APPROVED. The saved tree payload must include
+  species_source with one of these values:
+    MODEL_AUTO for top approved label with species_confidence >= 0.80
+    MODEL_CONFIRMED for top approved label with 0.60 <= species_confidence < 0.80
+                   after explicit farmer confirmation
+    MANUAL_SELECTED for farmer-chosen approved label after a low-confidence
+                    or NOT_APPROVED result
+  The backend accepts only approved species labels and validates that
+  species_source is consistent with species_confidence.
   Model provenance: the classifier is trained offline from a curated labeled
   species image dataset, exported as a versioned TFLite artifact, and shipped
   in src/assets/tflite/species_model.tflite. The display label
@@ -1929,11 +1989,14 @@ APPENDIX A: ALIGNMENT CLARIFICATIONS (APRIL 2026)
   Show a weak-signal warning when gps_accuracy_m > 20.
   Block saving a tree when gps_accuracy_m > 30.
 
-4. Parcel-wide GEDI fallback
-  If GEDI is unavailable for the entire parcel, show the height-measurement
-  control for every tree in the audit flow. The backend then uses AR-derived
-  height only for tree-level biomass calculation and excludes the GEDI feature
-  from the parcel model for that audit.
+4. Zone-level GEDI fallback and parcel-wide fallback
+  GET /api/v1/audit/zones computes gedi_available per zone.
+  If gedi_available=false for a zone, show the height-measurement control for
+  every tree in that zone.
+  If gedi_available=true for a zone, hide height capture and let the backend
+  resolve height from the nearest valid GEDI sample inside that zone.
+  If GEDI is unavailable for every zone in the parcel, exclude the GEDI
+  feature from the parcel model for that audit.
 
 5. COMPLETE_NO_CREDITS handling
   AuditCompleteScreen must treat COMPLETE_NO_CREDITS as a terminal success
@@ -1960,10 +2023,15 @@ APPENDIX A: ALIGNMENT CLARIFICATIONS (APRIL 2026)
   The production product requires an admin-assisted wallet rotation flow.
   After OTP + KYC re-verification on a new device, the app creates a
   replacement wallet locally and the backend performs the documented recovery
-  workflow. This is a production-launch dependency, not an optional future
-  enhancement.
+  workflow for future issuance. Already-issued on-chain balances remain at the
+  original wallet in v3.1 and must be disclosed clearly in the UI. This is a
+  production-launch dependency, not an optional future enhancement.
 
 10. Aadhaar compliance
+  Aadhaar is collected only because OTP proves phone possession, while the
+  platform also needs a one-time identity anchor for owner-name matching and
+  wallet-recovery re-verification.
+  It is not used for biomass calculation, credit minting, or routine app use.
   Plain Aadhaar is allowed only in volatile memory during form submission.
   It must never be written to Redux, MMKV, screenshots, analytics, or logs.
   Backend storage is hash-only.

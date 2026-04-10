@@ -11,7 +11,7 @@ import uuid
 from typing import Any, Dict, List
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
@@ -22,6 +22,7 @@ from app.database import (
     supabase_client,
 )
 from app.dependencies import get_current_user
+from app.rate_limit import RateLimitSpec, enforce_rate_limit
 from models.land import (
     BoundaryFetchResponse,
     DocumentUploadResponse,
@@ -43,6 +44,18 @@ ALLOWED_DOCUMENT_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png"}
 ALLOWED_DOCUMENT_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 PENDING_LAND_CONTEXT_TTL_SECONDS = 24 * 60 * 60
 OWNER_NAME_MATCH_THRESHOLD = 0.80
+VERIFY_DOCUMENT_RATE_LIMIT = RateLimitSpec(
+    scope="land.verify-document",
+    limit=10,
+    window_seconds=60 * 60,
+    error_message="Too many land-document verification requests. Please try again later.",
+)
+FETCH_BOUNDARY_RATE_LIMIT = RateLimitSpec(
+    scope="land.fetch-boundary",
+    limit=20,
+    window_seconds=60 * 60,
+    error_message="Too many boundary fetch requests. Please try again later.",
+)
 
 _pending_land_context_client: Redis | None = None
 _pending_land_context_initialised = False
@@ -61,6 +74,11 @@ def _normalise_name(name: str) -> str:
 def _name_similarity(left: str, right: str) -> float:
     """Return a fuzzy similarity ratio for owner-name matching."""
     return SequenceMatcher(None, _normalise_name(left), _normalise_name(right)).ratio()
+
+
+def _normalise_geojson_for_compare(geojson: Dict[str, Any]) -> str:
+    """Return a stable serialised form for server-side geometry comparison."""
+    return json.dumps(geojson, sort_keys=True, separators=(",", ":"))
 
 
 def _ensure_kyc_completed(current_user: Dict[str, Any]) -> None:
@@ -83,6 +101,63 @@ def _ensure_owner_name_matches_kyc(owner_name: str, current_user: Dict[str, Any]
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Owner name on document does not match your registered name.",
+        )
+
+
+def _ensure_pending_context_matches(
+    label: str,
+    expected_value: str | None,
+    received_value: str,
+) -> None:
+    """Reject client fields that differ from the verified server-side registration flow."""
+    if expected_value is None:
+        return
+
+    if _normalise_name(expected_value) == _normalise_name(received_value):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"{label} does not match the verified land document.",
+    )
+
+
+def _validate_pending_registration_context(
+    body: LandRegisterRequest,
+    pending_context: Dict[str, Any],
+    normalized_geojson: Dict[str, Any],
+) -> None:
+    """Ensure registration uses the verified OCR and boundary-fetch context."""
+    if not pending_context.get("owner_name") or not pending_context.get("doc_image_url"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Land document must be verified before registering land.",
+        )
+
+    _ensure_pending_context_matches("Owner name", pending_context.get("owner_name"), body.ocr_owner_name)
+    _ensure_pending_context_matches("District", pending_context.get("district"), body.district)
+    _ensure_pending_context_matches("Taluka", pending_context.get("taluka"), body.taluka)
+    _ensure_pending_context_matches("Village", pending_context.get("village"), body.village)
+    _ensure_pending_context_matches("State", pending_context.get("state"), body.state)
+
+    cached_boundary_source = pending_context.get("boundary_source")
+    cached_boundary_geojson = pending_context.get("boundary_geojson")
+    if cached_boundary_source and cached_boundary_source != body.boundary_source:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Boundary source does not match the verified land registration flow.",
+        )
+
+    if not cached_boundary_geojson:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Land boundary must be fetched and confirmed before registration.",
+        )
+
+    if _normalise_geojson_for_compare(cached_boundary_geojson) != _normalise_geojson_for_compare(normalized_geojson):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Submitted land boundary does not match the verified government boundary.",
         )
 
 
@@ -159,7 +234,7 @@ def _authenticated_storage_object_url(bucket: str, object_path: str) -> str:
 
 
 def _validate_document_upload(file: UploadFile, image_bytes: bytes) -> None:
-    """Validate documented land-record image constraints before OCR."""
+    """Validate documented JPG/PNG image constraints for OCR and manual map flows."""
     content_type = (file.content_type or "").lower()
     extension = Path(file.filename or "").suffix.lower()
 
@@ -199,6 +274,7 @@ async def verify_document(
 ):
     """Extract structured fields from a scanned land document using OCR."""
     _ensure_kyc_completed(current_user)
+    enforce_rate_limit(current_user["id"], VERIFY_DOCUMENT_RATE_LIMIT)
 
     if image is None:
         raise HTTPException(
@@ -282,6 +358,7 @@ async def fetch_boundary(
 ):
     """Attempt to auto-fetch the land boundary from government GIS layers."""
     _ensure_kyc_completed(current_user)
+    enforce_rate_limit(current_user["id"], FETCH_BOUNDARY_RATE_LIMIT)
 
     result = await land_boundary_service.fetch_land_boundary(
         survey_number=survey_number,
@@ -303,10 +380,70 @@ async def fetch_boundary(
                 "lgd_taluka_code": result.get("lgd_taluka_code"),
                 "lgd_village_code": result.get("lgd_village_code"),
                 "gis_code": result.get("gis_code"),
+                "boundary_geojson": result.get("geojson"),
             },
         )
 
     return BoundaryFetchResponse(**result)
+
+
+@router.post("/fetch-boundary", response_model=BoundaryFetchResponse)
+async def fetch_boundary_from_manual_map(
+    map_image: UploadFile | None = File(None, description="Downloaded government parcel map image"),
+    survey_number: str = Form(...),
+    district: str = Form(...),
+    taluka: str = Form(...),
+    village: str = Form(...),
+    state: str = Form(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Process a farmer-uploaded government map image into a parcel boundary."""
+    _ensure_kyc_completed(current_user)
+    enforce_rate_limit(current_user["id"], FETCH_BOUNDARY_RATE_LIMIT)
+
+    if map_image is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Multipart field 'map_image' is required.",
+        )
+
+    try:
+        image_bytes = await map_image.read()
+        _validate_document_upload(map_image, image_bytes)
+        result = await land_boundary_service.process_manual_boundary_map(
+            image_bytes=image_bytes,
+            survey_number=survey_number,
+            district=district,
+            taluka=taluka,
+            village=village,
+            state=state,
+        )
+        _cache_pending_land_context(
+            current_user["id"],
+            survey_number,
+            {
+                "district": district,
+                "taluka": taluka,
+                "village": village,
+                "state": state,
+                "boundary_source": result.get("boundary_source"),
+                "boundary_geojson": result.get("geojson"),
+            },
+        )
+        return BoundaryFetchResponse(**result)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Manual boundary processing failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Manual boundary processing failed.",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +517,11 @@ async def register_land(
         )
 
     pending_context = _get_pending_land_context(current_user["id"], body.survey_number)
+    _validate_pending_registration_context(
+        body,
+        pending_context,
+        boundary_analysis.get("normalized_geojson") or body.geojson,
+    )
 
     # --- 4. Insert into Supabase -------------------------------------------
     land_id = str(uuid.uuid4())
@@ -395,7 +537,6 @@ async def register_land(
         "boundary_source": body.boundary_source,
         "ocr_owner_name": body.ocr_owner_name,
         "boundary_geojson": boundary_analysis.get("normalized_geojson") or body.geojson,
-        "area_hectares": area_hectares,
         "is_verified": True,
         "doc_image_url": pending_context.get("doc_image_url"),
         "lgd_district_code": pending_context.get("lgd_district_code"),
@@ -482,8 +623,14 @@ async def list_lands(
                     id=parcel["id"],
                     farm_name=parcel.get("farm_name") or "Unnamed Field",
                     survey_number=parcel["survey_number"],
+                    district=parcel["district"],
+                    taluka=parcel["taluka"],
+                    village=parcel["village"],
+                    state=parcel.get("state") or "Maharashtra",
                     area_hectares=parcel.get("area_hectares") or 0.0,
                     is_verified=bool(parcel.get("is_verified", True)),
+                    boundary_source=parcel.get("boundary_source"),
+                    registered_at=parcel.get("registered_at"),
                     last_audit_year=last_audit_year,
                     current_audit_id=current_audit.get("id") if current_audit else None,
                     current_audit_status=current_audit.get("status") if current_audit else None,

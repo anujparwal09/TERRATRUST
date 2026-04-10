@@ -326,7 +326,7 @@ def generate_true_color_thumbnail_url(
     dimensions: int = 1024,
     max_cloud_pct: int = 20,
 ) -> str:
-    """Return a signed Supabase URL for a Sentinel-2 true-colour PNG when possible."""
+    """Return a signed Supabase URL for a persisted Sentinel-2 true-colour PNG."""
     _ensure_gee()
 
     region = _build_ee_region(boundary_geojson)
@@ -356,35 +356,32 @@ def generate_true_color_thumbnail_url(
     ).hexdigest()
     object_path = f"thumbnails/{thumbnail_key}-{dimensions}.png"
 
+    response = httpx.get(raw_thumbnail_url, timeout=60.0)
+    response.raise_for_status()
+
     try:
-        response = httpx.get(raw_thumbnail_url, timeout=60.0)
-        response.raise_for_status()
-
-        try:
-            supabase_client.storage.from_(THUMBNAIL_BUCKET).upload(
-                object_path,
-                response.content,
-            )
-        except Exception as exc:
-            if "exists" not in str(exc).lower() and "duplicate" not in str(exc).lower():
-                raise
-
-        signed_response = supabase_client.storage.from_(THUMBNAIL_BUCKET).create_signed_url(
+        supabase_client.storage.from_(THUMBNAIL_BUCKET).upload(
             object_path,
-            THUMBNAIL_TTL_SECONDS,
+            response.content,
         )
-        if isinstance(signed_response, dict):
-            signed_url = (
-                signed_response.get("signedURL")
-                or signed_response.get("signedUrl")
-                or signed_response.get("signed_url")
-            )
-            if signed_url:
-                return signed_url
     except Exception as exc:
-        logger.warning("Falling back to raw GEE thumbnail URL: %s", exc)
+        if "exists" not in str(exc).lower() and "duplicate" not in str(exc).lower():
+            raise
 
-    return raw_thumbnail_url
+    signed_response = supabase_client.storage.from_(THUMBNAIL_BUCKET).create_signed_url(
+        object_path,
+        THUMBNAIL_TTL_SECONDS,
+    )
+    if isinstance(signed_response, dict):
+        signed_url = (
+            signed_response.get("signedURL")
+            or signed_response.get("signedUrl")
+            or signed_response.get("signed_url")
+        )
+        if signed_url:
+            return signed_url
+
+    raise RuntimeError("Supabase did not return a signed URL for the generated thumbnail.")
 
 
 # ---------------------------------------------------------------------------

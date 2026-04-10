@@ -62,6 +62,8 @@ def _install_models_stub():
         full_name: str | None = None
         wallet_address: str | None = None
         kyc_completed: bool = False
+        wallet_recovery_status: str | None = None
+        wallet_recovery_requested_at: str | None = None
 
     class KYCRequest(_SimpleModel):
         full_name: str | None = None
@@ -97,6 +99,20 @@ def _install_models_stub():
 def _load_auth_modules():
     http_exception = _install_fastapi_stub()
     _install_models_stub()
+
+    web3_stub = types.ModuleType("web3")
+
+    class _Web3Stub:
+        @staticmethod
+        def is_address(value):
+            return isinstance(value, str) and value.startswith("0x") and len(value) == 42
+
+        @staticmethod
+        def to_checksum_address(value):
+            return value
+
+    web3_stub.Web3 = _Web3Stub
+    sys.modules["web3"] = web3_stub
 
     app_database_stub = types.ModuleType("app.database")
     app_database_stub.supabase_client = None
@@ -197,12 +213,56 @@ class _FakeUsersQuery:
 
 
 class _FakeSupabaseClient:
-    def __init__(self, users_store):
+    def __init__(self, users_store, recovery_store=None):
         self._users_store = users_store
+        self._recovery_store = recovery_store or []
 
     def table(self, table_name):
-        assert table_name == "users"
-        return _FakeUsersQuery(self._users_store)
+        if table_name == "users":
+            return _FakeUsersQuery(self._users_store)
+        if table_name == "wallet_recovery_requests":
+            return _FakeWalletRecoveryQuery(self._recovery_store)
+        raise AssertionError(f"Unsupported fake table: {table_name}")
+
+
+class _FakeWalletRecoveryQuery:
+    def __init__(self, recovery_store):
+        self._recovery_store = recovery_store
+        self._filters = []
+        self._limit = None
+        self._order_field = None
+        self._descending = False
+
+    def select(self, *_args, **_kwargs):
+        return self
+
+    def eq(self, field, value):
+        self._filters.append((field, value))
+        return self
+
+    def order(self, field, desc=False):
+        self._order_field = field
+        self._descending = desc
+        return self
+
+    def limit(self, count):
+        self._limit = count
+        return self
+
+    def execute(self):
+        rows = [
+            row.copy()
+            for row in self._recovery_store
+            if all(row.get(field) == value for field, value in self._filters)
+        ]
+        if self._order_field is not None:
+            rows.sort(
+                key=lambda row: row.get(self._order_field) or "",
+                reverse=self._descending,
+            )
+        if self._limit is not None:
+            rows = rows[: self._limit]
+        return _FakeResponse(rows)
 
 
 def test_provision_user_refetches_row_after_insert(monkeypatch):
@@ -235,6 +295,38 @@ def test_provision_user_refetches_row_after_update(monkeypatch):
 
     assert user["id"] == "user-1"
     assert user["phone_number"] == "+919999999999"
+
+
+def test_fetch_user_by_attaches_latest_wallet_recovery_state(monkeypatch):
+    users_store = [
+        {
+            "id": "user-1",
+            "firebase_uid": "firebase-1",
+            "phone_number": "+919999999999",
+            "full_name": "Farmer One",
+            "kyc_completed": True,
+            "wallet_address": WALLET_ONE,
+        }
+    ]
+    recovery_store = [
+        {
+            "user_id": "user-1",
+            "status": "REJECTED",
+            "requested_at": "2026-04-09T10:00:00Z",
+        },
+        {
+            "user_id": "user-1",
+            "status": "PENDING",
+            "requested_at": "2026-04-10T10:00:00Z",
+        },
+    ]
+    fake_client = _FakeSupabaseClient(users_store, recovery_store)
+    monkeypatch.setattr(dependencies, "supabase_client", fake_client)
+
+    user = dependencies._fetch_user_by("id", "user-1")
+
+    assert user["wallet_recovery_status"] == "PENDING"
+    assert user["wallet_recovery_requested_at"] == "2026-04-10T10:00:00Z"
 
 
 def test_get_current_user_returns_503_for_profile_provisioning_errors(monkeypatch):

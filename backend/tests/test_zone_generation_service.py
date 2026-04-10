@@ -112,10 +112,13 @@ from services import zone_generation_service
 
 
 def test_determine_zone_plan_scales_with_farm_size():
-    assert zone_generation_service._determine_zone_plan(0.2) == (3, 7.0)
+    assert zone_generation_service._determine_zone_plan(0.2) == (2, 7.0)
+    assert zone_generation_service._determine_zone_plan(0.35) == (3, 7.0)
     assert zone_generation_service._determine_zone_plan(1.0) == (4, 9.0)
     assert zone_generation_service._determine_zone_plan(2.5) == (5, 11.0)
     assert zone_generation_service._determine_zone_plan(5.0) == (6, 11.0)
+    assert zone_generation_service._determine_zone_plan(8.5) == (7, 11.0)
+    assert zone_generation_service._determine_zone_plan(12.0) == (8, 11.0)
 
 
 def test_distribute_zone_counts_spreads_remainder_across_bands():

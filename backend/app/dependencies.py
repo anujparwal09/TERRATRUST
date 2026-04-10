@@ -13,6 +13,35 @@ logger = logging.getLogger("terratrust.dependencies")
 USER_SELECT = "id, firebase_uid, phone_number, full_name, kyc_completed, wallet_address"
 
 
+def _attach_wallet_recovery_state(user: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the latest wallet-recovery request status for UI bootstrap flows."""
+    enriched_user = dict(user)
+    enriched_user.setdefault("wallet_recovery_status", None)
+    enriched_user.setdefault("wallet_recovery_requested_at", None)
+
+    try:
+        response = (
+            supabase_client.table("wallet_recovery_requests")
+            .select("status, requested_at")
+            .eq("user_id", user["id"])
+            .order("requested_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        latest_request = response.data[0] if response.data else None
+        if latest_request:
+            enriched_user["wallet_recovery_status"] = latest_request.get("status")
+            enriched_user["wallet_recovery_requested_at"] = latest_request.get("requested_at")
+    except Exception as exc:
+        logger.warning(
+            "Failed to load wallet recovery state for user %s: %s",
+            user.get("id"),
+            exc,
+        )
+
+    return enriched_user
+
+
 def _extract_phone_number(decoded_token: Dict[str, Any]) -> Optional[str]:
     """Extract the Firebase-authenticated phone number from decoded claims."""
     phone_number = decoded_token.get("phone_number")
@@ -38,7 +67,7 @@ def _fetch_user_by(field: str, value: str) -> Optional[Dict[str, Any]]:
         .limit(1)
         .execute()
     )
-    return response.data[0] if response.data else None
+    return _attach_wallet_recovery_state(response.data[0]) if response.data else None
 
 
 def _refresh_user_record(user_id: str) -> Dict[str, Any]:

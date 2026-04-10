@@ -184,6 +184,7 @@ Open the API docs at http://localhost:8000/docs and confirm these endpoints are 
 - `POST /api/v1/auth/recover-wallet`
 - `POST /api/v1/land/verify-document`
 - `GET /api/v1/land/fetch-boundary`
+- `POST /api/v1/land/fetch-boundary`
 - `POST /api/v1/land/register`
 - `GET /api/v1/land/list`
 - `PATCH /api/v1/land/{land_id}`

@@ -49,7 +49,7 @@ sys.modules.setdefault("services.ipfs_service", ipfs_stub)
 import hashlib
 import json
 
-from services.minting_service import _coerce_credit_amount, build_audit_metadata
+from services.minting_service import _coerce_credit_amount, _scale_gas_price, build_audit_metadata
 
 
 def test_build_audit_metadata_hashes_boundary_and_preserves_tree_details():
@@ -119,7 +119,13 @@ def test_build_audit_metadata_hashes_boundary_and_preserves_tree_details():
     assert metadata["boundary_verification_method"] == "WMS_AUTO"
 
 
-def test_coerce_credit_amount_truncates_to_whole_token_units():
-    assert _coerce_credit_amount(4.1) == 4
-    assert _coerce_credit_amount(4.6) == 4
-    assert _coerce_credit_amount(0.2) == 0
+def test_coerce_credit_amount_truncates_to_deci_ctt_units():
+    assert _coerce_credit_amount(4.1) == 41
+    assert _coerce_credit_amount(4.69) == 46
+    assert _coerce_credit_amount(0.2) == 2
+
+
+def test_scale_gas_price_rounds_up_for_documented_retry_bump():
+    assert _scale_gas_price(100, 1.0) == 100
+    assert _scale_gas_price(100, 1.2) == 120
+    assert _scale_gas_price(101, 1.2) == 122

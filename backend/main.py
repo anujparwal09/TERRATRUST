@@ -1,6 +1,7 @@
 """TerraTrust-AR FastAPI application entry point."""
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
@@ -13,6 +14,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 load_dotenv()
 
 from app.config import settings
+from app.database import verify_database_setup
 from app.firebase_auth import get_firebase_app
 from app.gee import ensure_gee_initialized
 from routers import auth, land, audit, credits
@@ -57,6 +59,38 @@ def _get_cors_origins() -> list[str]:
 
     return []
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Initialise critical SDKs during application lifespan startup."""
+    startup_errors: list[str] = []
+
+    try:
+        await verify_database_setup()
+        logger.info("Direct PostgreSQL/PostGIS connection verified.")
+    except Exception as exc:
+        logger.exception("Failed to verify direct PostgreSQL/PostGIS connection.")
+        startup_errors.append(f"Database/PostGIS startup verification failed: {exc}")
+
+    try:
+        get_firebase_app()
+        logger.info("Firebase Admin initialised.")
+    except Exception as exc:
+        logger.exception("Failed to initialise Firebase Admin.")
+        startup_errors.append(f"Firebase Admin initialisation failed: {exc}")
+
+    try:
+        ensure_gee_initialized()
+        logger.info("Google Earth Engine initialised.")
+    except Exception as exc:
+        logger.exception("Failed to initialise Google Earth Engine.")
+        startup_errors.append(f"Google Earth Engine initialisation failed: {exc}")
+
+    if startup_errors:
+        raise RuntimeError("; ".join(startup_errors))
+
+    yield
+
 # ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
@@ -66,6 +100,7 @@ app = FastAPI(
     version="3.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
@@ -165,27 +200,3 @@ async def application_status():
     }
 
 
-# ---------------------------------------------------------------------------
-# Startup event — initialise external SDKs
-# ---------------------------------------------------------------------------
-@app.on_event("startup")
-def startup_event():
-    """Initialise critical external SDKs and fail fast when they are unavailable."""
-    startup_errors: list[str] = []
-
-    try:
-        get_firebase_app()
-        logger.info("Firebase Admin initialised.")
-    except Exception as exc:
-        logger.exception("Failed to initialise Firebase Admin.")
-        startup_errors.append(f"Firebase Admin initialisation failed: {exc}")
-
-    try:
-        ensure_gee_initialized()
-        logger.info("Google Earth Engine initialised.")
-    except Exception as exc:
-        logger.exception("Failed to initialise Google Earth Engine.")
-        startup_errors.append(f"Google Earth Engine initialisation failed: {exc}")
-
-    if startup_errors:
-        raise RuntimeError("; ".join(startup_errors))

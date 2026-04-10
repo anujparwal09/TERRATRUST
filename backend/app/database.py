@@ -168,7 +168,6 @@ async def insert_land_parcel_record(land_record: Dict[str, Any]) -> Dict[str, An
             village,
             state,
             geom,
-            area_hectares,
             is_verified,
             boundary_source,
             ocr_owner_name,
@@ -189,7 +188,6 @@ async def insert_land_parcel_record(land_record: Dict[str, Any]) -> Dict[str, An
             :village,
             :state,
             ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON(:boundary_geojson), 4326)),
-            :area_hectares,
             :is_verified,
             :boundary_source,
             :ocr_owner_name,
@@ -214,7 +212,6 @@ async def insert_land_parcel_record(land_record: Dict[str, Any]) -> Dict[str, An
         "village": land_record["village"],
         "state": land_record.get("state", "Maharashtra"),
         "boundary_geojson": json.dumps(boundary_geojson),
-        "area_hectares": land_record.get("area_hectares"),
         "is_verified": land_record.get("is_verified", False),
         "boundary_source": land_record.get("boundary_source"),
         "ocr_owner_name": land_record.get("ocr_owner_name"),
@@ -242,13 +239,18 @@ async def list_land_parcels_for_user(user_id: str) -> List[Dict[str, Any]]:
             id,
             farm_name,
             survey_number,
+            district,
+            taluka,
+            village,
+            state,
             COALESCE(area_hectares, ST_Area(geom::geography) / 10000.0) AS area_hectares,
             COALESCE(is_verified, FALSE) AS is_verified,
-            created_at,
+            boundary_source,
+            created_at AS registered_at,
             ST_AsGeoJSON(geom) AS boundary_geojson
         FROM land_parcels
         WHERE user_id = :user_id
-        ORDER BY created_at DESC
+        ORDER BY registered_at DESC
         """
     )
 
@@ -380,6 +382,7 @@ async def insert_tree_scan_record(scan_record: Dict[str, Any]) -> None:
             gps_accuracy_m,
             species,
             species_confidence,
+            species_source,
             dbh_cm,
             height_m,
             gedi_height_m,
@@ -402,6 +405,7 @@ async def insert_tree_scan_record(scan_record: Dict[str, Any]) -> None:
             :gps_accuracy_m,
             :species,
             :species_confidence,
+            :species_source,
             :dbh_cm,
             :height_m,
             :gedi_height_m,
@@ -428,6 +432,7 @@ async def insert_tree_scan_record(scan_record: Dict[str, Any]) -> None:
         "gps_accuracy_m": scan_record.get("gps_accuracy_m"),
         "species": scan_record["species"],
         "species_confidence": scan_record.get("species_confidence"),
+        "species_source": scan_record.get("species_source"),
         "dbh_cm": scan_record["dbh_cm"],
         "height_m": scan_record.get("height_m"),
         "gedi_height_m": scan_record.get("gedi_height_m"),
@@ -461,6 +466,7 @@ async def list_tree_scans_for_audit(audit_id: str) -> List[Dict[str, Any]]:
             gps_accuracy_m,
             species,
             species_confidence,
+            species_source,
             dbh_cm,
             height_m,
             gedi_height_m,
@@ -543,3 +549,11 @@ async def update_tree_scan_measurements(measurements: List[Dict[str, Any]]) -> N
 
     async with engine.begin() as conn:
         await conn.execute(query, params)
+
+
+async def verify_database_setup() -> None:
+    """Fail fast when the documented direct PostgreSQL/PostGIS setup is unavailable."""
+    engine = _require_async_engine()
+
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT PostGIS_Version()"))

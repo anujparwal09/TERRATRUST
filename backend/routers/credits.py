@@ -8,6 +8,7 @@ from web3 import Web3
 from app.config import settings
 from app.database import supabase_client
 from app.dependencies import get_current_user
+from app.rate_limit import RateLimitSpec, enforce_rate_limit
 from models.blockchain import BalanceResponse, CreditHistory
 from services.ipfs_service import to_gateway_url
 from services.minting_service import load_contract_abi
@@ -17,6 +18,12 @@ logger = logging.getLogger("terratrust.credits")
 router = APIRouter()
 
 CARBON_CREDIT_TOKEN_ID = 1  # ERC-1155 token id for fungible credits
+BALANCE_RATE_LIMIT = RateLimitSpec(
+    scope="credits.balance",
+    limit=30,
+    window_seconds=60,
+    error_message="Too many credit balance requests. Please try again shortly.",
+)
 
 
 def _get_contract():
@@ -52,6 +59,8 @@ def get_balance(
     Combines the ERC-1155 ``balanceOf`` call with the Supabase
     ``carbon_audits`` table to build a unified view.
     """
+    enforce_rate_limit(current_user["id"], BALANCE_RATE_LIMIT)
+
     wallet_address = current_user.get("wallet_address")
     if not wallet_address:
         raise HTTPException(
@@ -64,7 +73,7 @@ def get_balance(
         contract = _get_contract()
         checksum = Web3.to_checksum_address(wallet_address)
         balance = contract.functions.balanceOf(checksum, CARBON_CREDIT_TOKEN_ID).call()
-        balance_ctt = float(balance)
+        balance_ctt = float(balance) / 10
     except Exception as exc:
         logger.error("balanceOf call failed for %s: %s", wallet_address, exc)
         raise HTTPException(

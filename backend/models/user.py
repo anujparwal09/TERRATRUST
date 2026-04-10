@@ -1,5 +1,7 @@
 """Pydantic schemas for backend authentication and user profile APIs."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -19,6 +21,8 @@ class AuthMeResponse(BaseModel):
     full_name: str | None = None
     wallet_address: str | None = None
     kyc_completed: bool = False
+    wallet_recovery_status: Literal["PENDING", "APPROVED", "REJECTED"] | None = None
+    wallet_recovery_requested_at: str | None = None
 
 
 class KYCResponse(BaseModel):

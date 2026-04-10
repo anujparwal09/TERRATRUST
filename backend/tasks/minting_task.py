@@ -26,6 +26,9 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
     Retries up to 2 times on failure; marks audit ``FAILED`` if
     all retries are exhausted.
     """
+    audit_data: dict = {}
+    farmer_address: str | None = None
+
     try:
         # --- Fetch data -----------------------------------------------------
         audit_resp = (
@@ -36,6 +39,20 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
             .execute()
         )
         audit_data = audit_resp.data
+
+        if audit_data.get("status") == "MINTED" and audit_data.get("tx_hash"):
+            return {
+                "audit_id": audit_id,
+                "status": "MINTED",
+                "tx_hash": audit_data.get("tx_hash"),
+                "ipfs_url": audit_data.get("ipfs_url"),
+                "block_number": audit_data.get("block_number"),
+            }
+
+        if audit_data.get("status") not in {"READY_TO_MINT", "MINTED"}:
+            raise ValueError(
+                f"Audit {audit_id} is not ready for minting. Current status: {audit_data.get('status')}"
+            )
 
         if float(audit_data.get("credits_issued") or 0) <= 0:
             supabase_client.table("carbon_audits").update(
@@ -62,6 +79,8 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
             raise ValueError(
                 f"User {audit_data['user_id']} does not have a wallet address."
             )
+
+        audit_id_int = uuid.UUID(audit_id).int
 
         # --- Build metadata -------------------------------------------------
         credit_result = {
@@ -95,7 +114,7 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
         mint_result = asyncio.run(
             minting_service.mint_carbon_credits(
                 farmer_address=farmer_address,
-                audit_id_int=uuid.UUID(audit_id).int,
+                audit_id_int=audit_id_int,
                 credit_amount=audit_data.get("credits_issued", 0),
                 metadata=metadata,
                 land_id=land_id,
@@ -112,7 +131,7 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
                 "ipfs_metadata_cid": ipfs_uri.removeprefix("ipfs://"),
                 "ipfs_url": mint_result["ipfs_url"],
                 "block_number": mint_result["block_number"],
-                "token_id": uuid.UUID(audit_id).int,
+                "token_id": audit_id_int,
                 "minted_at": datetime.now(timezone.utc).isoformat(),
             }
         ).eq("id", audit_id).execute()
@@ -126,6 +145,32 @@ def run_minting(self, audit_id: str, land_id: str, audit_year: int) -> dict:
 
     except Exception as exc:
         logger.error("Minting task failed for audit %s: %s", audit_id, exc)
+        try:
+            audit_id_int = uuid.UUID(audit_id).int
+            if farmer_address and "already minted" in str(exc).lower():
+                recovered_mint = minting_service.recover_existing_mint(
+                    farmer_address=farmer_address,
+                    audit_id_int=audit_id_int,
+                    land_id=land_id,
+                    audit_year=audit_year,
+                )
+                if recovered_mint is not None:
+                    ipfs_uri = recovered_mint.get("ipfs_url") or audit_data.get("ipfs_url")
+                    update_payload = {
+                        "status": "MINTED",
+                        "tx_hash": recovered_mint.get("tx_hash"),
+                        "ipfs_metadata_cid": ipfs_uri.removeprefix("ipfs://") if ipfs_uri else None,
+                        "ipfs_url": ipfs_uri,
+                        "block_number": recovered_mint.get("block_number"),
+                        "token_id": audit_id_int,
+                        "minted_at": audit_data.get("minted_at") or datetime.now(timezone.utc).isoformat(),
+                        "error": None,
+                    }
+                    supabase_client.table("carbon_audits").update(update_payload).eq("id", audit_id).execute()
+                    return {"audit_id": audit_id, **recovered_mint, "status": "MINTED"}
+        except Exception as recovery_exc:
+            logger.warning("Mint recovery failed for audit %s: %s", audit_id, recovery_exc)
+
         if self.request.retries >= self.max_retries:
             supabase_client.table("carbon_audits").update(
                 {"status": "FAILED", "error": str(exc)[:500]}

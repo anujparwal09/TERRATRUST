@@ -1,18 +1,28 @@
 """Land boundary service implementing the documented 3-layer fetch flow."""
 
+import asyncio
+
 import json
 import logging
 import re
 from html import unescape
 from typing import Any, Dict, Optional, Sequence
 
+import cv2
 import httpx
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
+import numpy as np
 from redis import Redis
-from shapely.geometry import shape
+
+try:
+    from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
+except ImportError:  # pragma: no cover - optional fallback dependency
+    Page = Any  # type: ignore[assignment]
+    PlaywrightTimeoutError = TimeoutError  # type: ignore[assignment]
+    async_playwright = None
 
 from app.config import settings
-from services import satellite_service
+from app.database import analyse_boundary_geojson
+from services import ocr_service, satellite_service
 
 logger = logging.getLogger("terratrust.land_boundary")
 
@@ -84,6 +94,10 @@ DEFAULT_LAYER2_SELECTORS: Dict[str, Sequence[str]] = {
         "a:has-text('Search')",
     ),
 }
+COORDINATE_LAT_RANGE = (6.0, 38.0)
+COORDINATE_LNG_RANGE = (68.0, 98.0)
+LGD_API_MAX_ATTEMPTS = 3
+LGD_API_INITIAL_BACKOFF_SECONDS = 2
 
 
 def _get_state_config(state: str) -> Optional[Dict[str, str]]:
@@ -135,6 +149,73 @@ def _build_lgd_cache_key(district: str, taluka: str, village: str) -> str:
         taluka=taluka.strip().lower(),
         village=village.strip().lower(),
     )
+
+
+def _matches_location_record(
+    record: Dict[str, Any],
+    target: str,
+    candidate_keys: Sequence[str],
+) -> bool:
+    """Return whether a location record contains a name matching the OCR-extracted target."""
+    for key in candidate_keys:
+        value = record.get(key)
+        if isinstance(value, str) and _text_matches(value, target):
+            return True
+    return False
+
+
+def _lgd_retry_delay_seconds(attempt_number: int) -> int:
+    """Return the SRS-defined LGD backoff delay for a 1-based attempt number."""
+    return LGD_API_INITIAL_BACKOFF_SECONDS * (2 ** max(attempt_number - 1, 0))
+
+
+def _describe_http_failure(exc: Exception) -> str:
+    """Summarise an HTTP failure for operator logs."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    return str(exc)
+
+
+async def _post_json_with_retries(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    operation: str,
+    log_context: str,
+    json_payload: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """POST to the LGD API using the documented retry/backoff policy."""
+    last_exc: Exception | None = None
+
+    for attempt in range(1, LGD_API_MAX_ATTEMPTS + 1):
+        try:
+            request_kwargs = {"json": json_payload} if json_payload is not None else {}
+            response = await client.post(url, **request_kwargs)
+            response.raise_for_status()
+            return response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            last_exc = exc
+            if attempt >= LGD_API_MAX_ATTEMPTS:
+                break
+
+            delay_seconds = _lgd_retry_delay_seconds(attempt)
+            logger.warning(
+                "LGD API %s failed for %s on attempt %d/%d: %s. Retrying in %ds.",
+                operation,
+                log_context,
+                attempt,
+                LGD_API_MAX_ATTEMPTS,
+                _describe_http_failure(exc),
+                delay_seconds,
+            )
+            await asyncio.sleep(delay_seconds)
+
+    if last_exc is None:
+        raise RuntimeError(f"LGD API {operation} failed for {log_context}.")
+
+    raise RuntimeError(
+        f"LGD API {operation} failed for {log_context} after {LGD_API_MAX_ATTEMPTS} attempts."
+    ) from last_exc
 
 
 async def _select_option_by_text(
@@ -431,47 +512,83 @@ async def get_lgd_codes(district: str, taluka: str, village: str) -> Dict[str, i
         except Exception as exc:
             logger.warning("Failed to read LGD cache %s: %s", cache_key, exc)
 
+    log_context = f"district={district}, taluka={taluka}, village={village}"
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         # 1. Get district code
-        resp = await client.post(f"{LGD_BASE_URL}/GetAllDistricts")
-        resp.raise_for_status()
-        districts = resp.json()
+        districts = await _post_json_with_retries(
+            client,
+            f"{LGD_BASE_URL}/GetAllDistricts",
+            operation="GetAllDistricts",
+            log_context=log_context,
+        )
         dist_code: Optional[int] = None
         for d in districts:
-            d_name = d.get("distname_eng", d.get("districtName", d.get("name", "")))
-            if d_name.strip().lower() == district.strip().lower():
+            if _matches_location_record(
+                d,
+                district,
+                (
+                    "distname_eng",
+                    "distname_mar",
+                    "districtName",
+                    "districtNameLocal",
+                    "name",
+                ),
+            ):
                 dist_code = d.get("distcode", d.get("districtCode", d.get("code")))
                 break
         if dist_code is None:
             raise ValueError(f"District '{district}' not found in LGD directory.")
 
         # 2. Get taluka code
-        resp = await client.post(
+        talukas = await _post_json_with_retries(
+            client,
             f"{LGD_BASE_URL}/GetTalukasOfDistrict",
-            json={"distcode": dist_code},
+            operation="GetTalukasOfDistrict",
+            log_context=log_context,
+            json_payload={"distcode": dist_code},
         )
-        resp.raise_for_status()
-        talukas = resp.json()
         taluka_code: Optional[int] = None
         for t in talukas:
-            t_name = t.get("talukaname_eng", t.get("talukaName", t.get("name", "")))
-            if t_name.strip().lower() == taluka.strip().lower():
+            if _matches_location_record(
+                t,
+                taluka,
+                (
+                    "talukaname_eng",
+                    "talukaname_mar",
+                    "talukaName",
+                    "talukaNameLocal",
+                    "tehsilName",
+                    "name",
+                ),
+            ):
                 taluka_code = t.get("talukacode", t.get("talukaCode", t.get("code")))
                 break
         if taluka_code is None:
             raise ValueError(f"Taluka '{taluka}' not found under district code {dist_code}.")
 
         # 3. Get village code
-        resp = await client.post(
+        villages = await _post_json_with_retries(
+            client,
             f"{LGD_BASE_URL}/GetVillagesOfDistrictAndTaluka",
-            json={"distcode": dist_code, "talukacode": taluka_code},
+            operation="GetVillagesOfDistrictAndTaluka",
+            log_context=log_context,
+            json_payload={"distcode": dist_code, "talukacode": taluka_code},
         )
-        resp.raise_for_status()
-        villages = resp.json()
         village_code: Optional[int] = None
         for v in villages:
-            v_name = v.get("villagename_eng", v.get("villageName", v.get("name", "")))
-            if v_name.strip().lower() == village.strip().lower():
+            if _matches_location_record(
+                v,
+                village,
+                (
+                    "villagename_eng",
+                    "villagename_mar",
+                    "villageName",
+                    "villageNameLocal",
+                    "gaonName",
+                    "name",
+                ),
+            ):
                 village_code = v.get("villagecode", v.get("villageCode", v.get("code")))
                 break
         if village_code is None:
@@ -587,7 +704,15 @@ async def fetch_boundary_layer1(
         return None
 
     except Exception as exc:
-        logger.warning("Layer 1 (WMS) failed: %s", exc)
+        logger.warning(
+            "Layer 1 (WMS) failed for survey %s in %s, %s, %s, %s: %s",
+            survey_number,
+            village,
+            taluka,
+            district,
+            state,
+            exc,
+        )
         return None
 
 
@@ -612,6 +737,12 @@ async def fetch_boundary_layer2(
     state_config = _get_state_config(state)
     if state_config is None:
         logger.info("Layer 2 (scrape) is not configured for state '%s'.", state)
+        return None
+
+    if async_playwright is None:
+        logger.warning(
+            "Layer 2 (Playwright scrape) is unavailable because the playwright package is not installed."
+        )
         return None
 
     portal_url = state_config.get("portal_url")
@@ -671,15 +802,6 @@ async def fetch_boundary_layer2(
     return None
 
 
-def _estimate_area_hectares(geojson: Dict[str, Any]) -> Optional[float]:
-    """Estimate polygon area in hectares for response payloads."""
-    try:
-        geom = shape(geojson)
-        return round(geom.area * 111320 * 111320 / 10000, 4)
-    except Exception:
-        return None
-
-
 def _safe_satellite_thumbnail_url(geojson: Dict[str, Any]) -> Optional[str]:
     """Best-effort thumbnail generation for boundary confirmation screens."""
     try:
@@ -689,20 +811,30 @@ def _safe_satellite_thumbnail_url(geojson: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-def _build_boundary_success_response(
+async def _build_boundary_success_response(
     boundary_source: str,
     boundary_payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Return a boundary response compatible with both documented field names."""
     geojson = boundary_payload["geojson"]
-    satellite_url = _safe_satellite_thumbnail_url(geojson)
+    area_hectares = None
+    try:
+        analysis = await analyse_boundary_geojson(geojson)
+        if analysis.get("is_valid"):
+            geojson = analysis.get("normalized_geojson") or geojson
+            raw_area = analysis.get("area_hectares")
+            area_hectares = round(float(raw_area), 4) if raw_area is not None else None
+    except Exception as exc:
+        logger.warning("Failed to normalise boundary geometry: %s", exc)
+
+    satellite_url = await asyncio.to_thread(_safe_satellite_thumbnail_url, geojson)
     response = {
         "status": "success",
         "boundary_source": boundary_source,
         "satellite_png_url": satellite_url,
         "satellite_thumbnail_url": satellite_url,
         "geojson": geojson,
-        "area_hectares": _estimate_area_hectares(geojson),
+        "area_hectares": area_hectares,
     }
     response.update(
         {
@@ -717,6 +849,167 @@ def _build_boundary_success_response(
         }
     )
     return response
+
+
+def _decode_manual_map_image(image_bytes: bytes) -> np.ndarray:
+    """Decode a farmer-uploaded map image into an OpenCV matrix."""
+    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("Could not decode the uploaded map image.")
+    return image
+
+
+def _extract_manual_map_contour(image_bytes: bytes) -> list[tuple[float, float]]:
+    """Extract the dominant parcel contour from a government parcel map image."""
+    image = _decode_manual_map_image(image_bytes)
+    grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(grayscale, (5, 5), 0)
+    thresholded = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        7,
+    )
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    cleaned = cv2.morphologyEx(thresholded, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _hierarchy = cv2.findContours(
+        cleaned,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    image_area = float(image.shape[0] * image.shape[1])
+    candidate_contours = [
+        contour
+        for contour in contours
+        if image_area * 0.01 <= cv2.contourArea(contour) <= image_area * 0.95
+    ]
+    if not candidate_contours:
+        raise ValueError(
+            "Could not extract a valid parcel boundary from the uploaded map."
+        )
+
+    best_contour = max(candidate_contours, key=cv2.contourArea)
+    perimeter = cv2.arcLength(best_contour, True)
+    simplified = cv2.approxPolyDP(best_contour, 0.005 * perimeter, True)
+    if len(simplified) < 4:
+        raise ValueError(
+            "Could not extract a valid parcel boundary from the uploaded map."
+        )
+
+    contour_points = [
+        (float(point[0][0]), float(point[0][1]))
+        for point in simplified
+    ]
+    if contour_points[0] != contour_points[-1]:
+        contour_points.append(contour_points[0])
+    return contour_points
+
+
+def _fit_linear_coordinate_map(samples: list[tuple[float, float]]) -> tuple[float, float]:
+    """Fit a linear pixel-to-coordinate transform from OCR-derived map labels."""
+    distinct_samples = list(dict.fromkeys((round(pixel, 3), round(value, 8)) for pixel, value in samples))
+    if len(distinct_samples) < 2:
+        raise ValueError(
+            "Could not georeference the uploaded map because the coordinate labels were incomplete."
+        )
+
+    pixels = np.array([sample[0] for sample in distinct_samples], dtype=np.float64)
+    values = np.array([sample[1] for sample in distinct_samples], dtype=np.float64)
+    if np.allclose(pixels, pixels[0]):
+        raise ValueError(
+            "Could not georeference the uploaded map because the coordinate labels were incomplete."
+        )
+
+    slope, intercept = np.polyfit(pixels, values, 1)
+    return float(slope), float(intercept)
+
+
+def _extract_coordinate_axis_samples(image_bytes: bytes) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Extract OCR-labelled longitude and latitude samples from a printed map image."""
+    raw_annotations = ocr_service.extract_text_annotations(image_bytes)
+    annotations = raw_annotations
+    if not annotations:
+        annotations = ocr_service.extract_text_annotations(
+            ocr_service.preprocess_document_image(image_bytes)
+        )
+
+    x_axis_samples: list[tuple[float, float]] = []
+    y_axis_samples: list[tuple[float, float]] = []
+    for annotation in annotations:
+        for token in ocr_service.COORDINATE_TOKEN_RE.findall(annotation["text"]):
+            value = float(token)
+            if COORDINATE_LNG_RANGE[0] <= value <= COORDINATE_LNG_RANGE[1]:
+                x_axis_samples.append((float(annotation["center_x"]), value))
+            elif COORDINATE_LAT_RANGE[0] <= value <= COORDINATE_LAT_RANGE[1]:
+                y_axis_samples.append((float(annotation["center_y"]), value))
+
+    return x_axis_samples, y_axis_samples
+
+
+def _contour_to_geojson(
+    contour_points: list[tuple[float, float]],
+    x_transform: tuple[float, float],
+    y_transform: tuple[float, float],
+) -> Dict[str, Any]:
+    """Convert pixel contour points into a geographic polygon."""
+    x_slope, x_intercept = x_transform
+    y_slope, y_intercept = y_transform
+    coordinates = [
+        [
+            (x_slope * pixel_x) + x_intercept,
+            (y_slope * pixel_y) + y_intercept,
+        ]
+        for pixel_x, pixel_y in contour_points
+    ]
+    return {"type": "Polygon", "coordinates": [coordinates]}
+
+
+async def process_manual_boundary_map(
+    image_bytes: bytes,
+    survey_number: str,
+    district: str,
+    taluka: str,
+    village: str,
+    state: str,
+) -> Dict[str, Any]:
+    """Extract and georeference a farmer-uploaded government parcel map image."""
+    try:
+        contour_points = _extract_manual_map_contour(image_bytes)
+        x_axis_samples, y_axis_samples = _extract_coordinate_axis_samples(image_bytes)
+        geojson = _contour_to_geojson(
+            contour_points,
+            _fit_linear_coordinate_map(x_axis_samples),
+            _fit_linear_coordinate_map(y_axis_samples),
+        )
+        result = await _build_boundary_success_response(
+            "MANUAL",
+            {"geojson": geojson},
+        )
+    except ValueError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Manual boundary extraction failed for survey %s (%s, %s, %s, %s): %s",
+            survey_number,
+            village,
+            taluka,
+            district,
+            state,
+            exc,
+        )
+        raise ValueError(
+            "Could not extract a valid parcel boundary from the uploaded map."
+        ) from exc
+
+    if result.get("status") != "success" or not result.get("geojson"):
+        raise ValueError(
+            "Could not extract a valid parcel boundary from the uploaded map."
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -747,14 +1040,14 @@ async def fetch_land_boundary(
         survey_number, district, taluka, village, state, user_lat, user_lng
     )
     if boundary_payload:
-        return _build_boundary_success_response("WMS_AUTO", boundary_payload)
+        return await _build_boundary_success_response("WMS_AUTO", boundary_payload)
 
     # Layer 2 — Playwright scraping
     boundary_payload = await fetch_boundary_layer2(
         survey_number, district, taluka, village, state, user_lat, user_lng
     )
     if boundary_payload:
-        return _build_boundary_success_response("SCRAPE", boundary_payload)
+        return await _build_boundary_success_response("SCRAPE", boundary_payload)
 
     # All layers exhausted
     logger.warning(

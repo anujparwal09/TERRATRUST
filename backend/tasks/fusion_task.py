@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from tasks.celery_app import celery_app
 from app.database import (
     fetch_land_parcel_record,
+    list_sampling_zones_for_audit,
     list_tree_scans_for_audit,
     supabase_client,
     update_tree_scan_measurements,
@@ -14,9 +15,16 @@ from app.database import (
 from services import fusion_engine
 
 logger = logging.getLogger("terratrust.tasks.fusion")
+FUSION_RETRY_DELAYS_SECONDS = (5 * 60, 30 * 60)
 
 
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=30)
+def _fusion_retry_delay_seconds(retry_count: int) -> int:
+    """Return the SRS-defined delay for the next fusion retry."""
+    index = min(max(retry_count, 0), len(FUSION_RETRY_DELAYS_SECONDS) - 1)
+    return FUSION_RETRY_DELAYS_SECONDS[index]
+
+
+@celery_app.task(bind=True, max_retries=2)
 def run_audit_fusion(self, audit_id: str) -> dict:
     """Execute the full fusion pipeline for a single audit.
 
@@ -29,8 +37,8 @@ def run_audit_fusion(self, audit_id: str) -> dict:
     5. Persist results in ``carbon_audits``.
     6. Trigger ``minting_task`` to mint the audit certificate and any credits.
 
-    On exception the task retries up to 2 times with a 30 s delay,
-    then marks the audit ``FAILED``.
+    On exception the task retries up to 2 times with the documented
+    5-minute then 30-minute backoff, then marks the audit ``FAILED``.
     """
     try:
         # --- 1. Update status -----------------------------------------------
@@ -59,6 +67,7 @@ def run_audit_fusion(self, audit_id: str) -> dict:
 
         # Fetch tree scans
         tree_scans = asyncio.run(list_tree_scans_for_audit(audit_id))
+        sampling_zones = asyncio.run(list_sampling_zones_for_audit(audit_id))
 
         # --- 3. Run fusion --------------------------------------------------
         fusion_result = fusion_engine.run_fusion(
@@ -67,6 +76,7 @@ def run_audit_fusion(self, audit_id: str) -> dict:
             tree_scans=tree_scans,
             land_boundary_geojson=boundary_geojson,
             audit_year=audit_year,
+            sampling_zones=sampling_zones,
         )
 
         # --- 4. Calculate credits -------------------------------------------
@@ -147,5 +157,15 @@ def run_audit_fusion(self, audit_id: str) -> dict:
                 {"status": "FAILED", "error": str(exc)[:500]}
             ).eq("id", audit_id).execute()
             raise
-        # Retry
-        raise self.retry(exc=exc)
+
+        countdown = _fusion_retry_delay_seconds(self.request.retries)
+        next_attempt = self.request.retries + 2
+        total_attempts = self.max_retries + 1
+        logger.warning(
+            "Scheduling fusion retry for audit %s in %d seconds (attempt %d/%d).",
+            audit_id,
+            countdown,
+            next_attempt,
+            total_attempts,
+        )
+        raise self.retry(exc=exc, countdown=countdown)

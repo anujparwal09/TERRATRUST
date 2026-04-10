@@ -113,6 +113,7 @@ create table if not exists ar_tree_scans (
     gps_accuracy_m decimal(6, 2),
     species varchar(100) not null,
     species_confidence decimal(5, 4),
+    species_source varchar(20) not null default 'MODEL_AUTO',
     dbh_cm decimal(6, 2) not null,
     height_m decimal(6, 2),
     gedi_height_m decimal(6, 2),
@@ -133,7 +134,13 @@ alter table if exists carbon_audits add column if not exists trees_scanned_count
 alter table if exists carbon_audits add column if not exists reason text;
 alter table if exists sampling_zones add column if not exists gedi_available boolean default false;
 alter table if exists ar_tree_scans add column if not exists species_confidence decimal(5, 4);
+alter table if exists ar_tree_scans add column if not exists species_source varchar(20);
 alter table if exists ar_tree_scans add column if not exists scan_timestamp timestamptz;
+update ar_tree_scans
+set species_source = 'MODEL_AUTO'
+where species_source is null;
+alter table if exists ar_tree_scans alter column species_source set default 'MODEL_AUTO';
+alter table if exists ar_tree_scans alter column species_source set not null;
 
 create or replace function update_land_area()
 returns trigger as $$

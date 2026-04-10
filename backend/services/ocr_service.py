@@ -15,6 +15,7 @@ from PIL import Image, ImageOps
 logger = logging.getLogger("terratrust.ocr")
 
 _vision_client: vision.ImageAnnotatorClient | None = None
+COORDINATE_TOKEN_RE = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d{2,8}))(?!\d)")
 
 
 def _get_vision_client() -> vision.ImageAnnotatorClient:
@@ -98,6 +99,37 @@ def _run_document_ocr(image_bytes: bytes) -> str:
     if response.error.message:
         raise RuntimeError(f"Cloud Vision OCR failed: {response.error.message}")
     return (response.full_text_annotation.text or "").strip()
+
+
+def extract_text_annotations(image_bytes: bytes) -> list[Dict[str, Any]]:
+    """Return OCR text annotations with bounding-box centres for map georeferencing."""
+    response = _get_vision_client().document_text_detection(
+        image=vision.Image(content=image_bytes)
+    )
+    if response.error.message:
+        raise RuntimeError(f"Cloud Vision OCR failed: {response.error.message}")
+
+    annotations: list[Dict[str, Any]] = []
+    for annotation in response.text_annotations[1:]:
+        text = (annotation.description or "").strip()
+        if not text:
+            continue
+
+        vertices = annotation.bounding_poly.vertices or []
+        if not vertices:
+            continue
+
+        x_values = [float(vertex.x or 0) for vertex in vertices]
+        y_values = [float(vertex.y or 0) for vertex in vertices]
+        annotations.append(
+            {
+                "text": text,
+                "center_x": sum(x_values) / len(x_values),
+                "center_y": sum(y_values) / len(y_values),
+            }
+        )
+
+    return annotations
 
 
 def _extract_fields_from_text(full_text: str) -> Dict[str, Any]:

@@ -24,9 +24,11 @@ from app.database import (
     supabase_client,
 )
 from app.dependencies import get_current_user
+from app.rate_limit import RateLimitSpec, enforce_rate_limit
 from models.audit import (
     AuditHistoryItem,
     AuditHistoryResponse,
+    AuditResultResponse,
     AuditSubmitRequest,
     AuditSubmitResponse,
     AuditZonesResponse,
@@ -42,6 +44,34 @@ router = APIRouter()
 
 MAX_EVIDENCE_WIDTH = 1280
 MAX_EVIDENCE_HEIGHT = 960
+AUDIT_ZONES_RATE_LIMIT = RateLimitSpec(
+    scope="audit.zones",
+    limit=5,
+    window_seconds=60 * 60,
+    error_message="Too many audit zone requests. Please try again later.",
+)
+AUDIT_SUBMIT_RATE_LIMIT = RateLimitSpec(
+    scope="audit.submit-samples",
+    limit=3,
+    window_seconds=60 * 60,
+    error_message="Too many audit submission requests. Please try again later.",
+)
+AUDIT_RESULT_RATE_LIMIT = RateLimitSpec(
+    scope="audit.result",
+    limit=60,
+    window_seconds=60,
+    error_message="Too many audit status requests. Please wait before polling again.",
+)
+
+
+def _processing_submit_response(audit_id: str) -> AuditSubmitResponse:
+    """Return the documented acknowledgement payload for non-terminal audit submissions."""
+    return AuditSubmitResponse(
+        status="PROCESSING",
+        audit_id=audit_id,
+        estimated_seconds=60,
+        message="Satellite verification in progress",
+    )
 
 def _normalise_species_name(species: str) -> str:
     """Return the canonical supported species name or fail clearly."""
@@ -129,6 +159,40 @@ def _to_utc_iso(timestamp: datetime) -> str:
     return timestamp.astimezone(timezone.utc).isoformat()
 
 
+def _validate_species_submission(tree) -> None:
+    """Validate species confidence against the documented species_source contract."""
+    if tree.species_source == "MODEL_AUTO":
+        if tree.species_confidence < 0.80:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Tree sample in zone '{tree.zone_id}' must use MODEL_AUTO only when "
+                    "species_confidence is at least 0.80."
+                ),
+            )
+        return
+
+    if tree.species_source == "MODEL_CONFIRMED":
+        if not (0.60 <= tree.species_confidence < 0.80):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Tree sample in zone '{tree.zone_id}' must use MODEL_CONFIRMED only when "
+                    "species_confidence is between 0.60 and 0.79."
+                ),
+            )
+        return
+
+    if tree.species_source == "MANUAL_SELECTED" and tree.species_confidence >= 0.60:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Tree sample in zone '{tree.zone_id}' must use MANUAL_SELECTED only after a "
+                "low-confidence or NOT_APPROVED model result."
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # GET /zones
 # ---------------------------------------------------------------------------
@@ -142,6 +206,8 @@ async def get_audit_zones(
     Creates a new audit record in Supabase with status ``PROCESSING``
     and returns the list of zones with walking path estimate.
     """
+    enforce_rate_limit(current_user["id"], AUDIT_ZONES_RATE_LIMIT)
+
     try:
         land_data = await fetch_land_parcel_record(land_id)
     except LookupError as exc:
@@ -302,6 +368,8 @@ async def submit_samples(
     - At least **3** trees per zone.
     - Each tree must have valid photo data.
     """
+    enforce_rate_limit(current_user["id"], AUDIT_SUBMIT_RATE_LIMIT)
+
     trees = body.trees
 
     try:
@@ -334,32 +402,65 @@ async def submit_samples(
             detail="You do not have access to this audit session.",
         )
 
-    if audit_data.get("status") != "PROCESSING":
+    current_status = audit_data.get("status")
+    if current_status in {"CALCULATING", "READY_TO_MINT"}:
+        return _processing_submit_response(body.audit_id)
+
+    if current_status in {"MINTED", "COMPLETE_NO_CREDITS", "FAILED"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This audit is already in a terminal state and cannot be resubmitted.",
+        )
+
+    if current_status != "PROCESSING":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Tree samples can only be submitted while the audit is in PROCESSING state.",
         )
 
-    # --- Minimum total check -----------------------------------------------
-    if len(trees) < 9:
+    # --- Ensure submitted zones belong to the audit -----------------------
+    try:
+        sampling_zones = await list_sampling_zones_for_audit(body.audit_id)
+        zone_map = {zone["id"]: zone for zone in sampling_zones}
+        valid_zone_ids = set(zone_map)
+        if not valid_zone_ids:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="No sampling zones were found for this audit session.",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to validate sampling zones for this audit.",
+        ) from exc
+
+    min_trees_required = len(valid_zone_ids) * 3
+    if len(trees) < min_trees_required:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"At least 9 tree samples are required. Received {len(trees)}.",
+            detail=f"Minimum {min_trees_required} trees required for this audit.",
         )
 
     # --- Species and per-zone checks ---------------------------------------
     zone_counts: Dict[str, int] = Counter(t.zone_id for t in trees)
     canonical_species: Dict[int, str] = {}
     for index, tree in enumerate(trees):
-        if tree.species_confidence < 0.80:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Tree sample in zone '{tree.zone_id}' has species confidence "
-                    f"{tree.species_confidence:.2f}. Minimum allowed is 0.80."
-                ),
-            )
+        _validate_species_submission(tree)
         canonical_species[index] = _normalise_species_name(tree.species)
+
+    invalid_zone_ids = sorted(
+        {tree.zone_id for tree in trees if tree.zone_id not in valid_zone_ids}
+    )
+    if invalid_zone_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Submitted tree samples contain zone IDs that do not belong "
+                f"to audit '{body.audit_id}': {', '.join(invalid_zone_ids)}."
+            ),
+        )
 
     for zone_id, count in zone_counts.items():
         if count < 3:
@@ -390,29 +491,8 @@ async def submit_samples(
                 ),
             )
 
-    # --- Ensure submitted zones belong to the audit -----------------------
+    # --- Zone geometry + GEDI checks --------------------------------------
     try:
-        sampling_zones = await list_sampling_zones_for_audit(body.audit_id)
-        zone_map = {zone["id"]: zone for zone in sampling_zones}
-        valid_zone_ids = set(zone_map)
-        if not valid_zone_ids:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="No sampling zones were found for this audit session.",
-            )
-
-        invalid_zone_ids = sorted(
-            {tree.zone_id for tree in trees if valid_zone_ids and tree.zone_id not in valid_zone_ids}
-        )
-        if invalid_zone_ids:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "Submitted tree samples contain zone IDs that do not belong "
-                    f"to audit '{body.audit_id}': {', '.join(invalid_zone_ids)}."
-                ),
-            )
-
         missing_zone_ids = sorted(valid_zone_ids - set(zone_counts))
         if missing_zone_ids:
             raise HTTPException(
@@ -519,6 +599,7 @@ async def submit_samples(
             "zone_id": tree.zone_id,
             "species": species_name,
             "species_confidence": tree.species_confidence,
+            "species_source": tree.species_source,
             "dbh_cm": tree.dbh_cm,
             "height_m": tree.height_m,
             "gps": {"lat": tree.gps.lat, "lng": tree.gps.lng},
@@ -577,18 +658,17 @@ async def submit_samples(
         body.audit_id,
     )
 
-    return AuditSubmitResponse(
-        status="processing",
-        audit_id=body.audit_id,
-        estimated_seconds=60,
-        message="Satellite verification in progress",
-    )
+    return _processing_submit_response(body.audit_id)
 
 
 # ---------------------------------------------------------------------------
 # GET /result/{audit_id}
 # ---------------------------------------------------------------------------
-@router.get("/result/{audit_id}")
+@router.get(
+    "/result/{audit_id}",
+    response_model=AuditResultResponse,
+    response_model_exclude_none=True,
+)
 def get_audit_result(
     audit_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -601,6 +681,8 @@ def get_audit_result(
     - ``status='CALCULATING'`` or ``'PROCESSING'`` → still in progress.
     - ``status='FAILED'`` → error description.
     """
+    enforce_rate_limit(current_user["id"], AUDIT_RESULT_RATE_LIMIT)
+
     try:
         resp = (
             supabase_client.table("carbon_audits")
@@ -653,7 +735,7 @@ def get_audit_result(
         }
 
     if current_status in ("CALCULATING", "PROCESSING", "READY_TO_MINT"):
-        return {"status": "CALCULATING"}
+        return {"status": current_status}
 
     if current_status == "FAILED":
         return {

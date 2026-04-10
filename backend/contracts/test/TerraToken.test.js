@@ -22,20 +22,20 @@ describe("TerraTrustToken", function () {
     return { token, owner, farmer, buyer };
   }
 
-  it("mints credits and an audit certificate with the documented parameter order", async function () {
+  it("mints raw deci-CTT units and an audit certificate with the documented parameter order", async function () {
     const { token, farmer } = await deployFixture();
     const auditId = 1001n;
 
     await token.mintAudit(
       farmer.address,
       auditId,
-      12,
+      124,
       "ipfs://cid-123",
       "land-1",
       2026
     );
 
-    expect(await token.balanceOf(farmer.address, 1)).to.equal(12n);
+    expect(await token.balanceOf(farmer.address, 1)).to.equal(124n);
     expect(await token.balanceOf(farmer.address, auditId)).to.equal(1n);
     expect(await token.getAuditEvidence(auditId)).to.equal("ipfs://cid-123");
   });
@@ -46,7 +46,7 @@ describe("TerraTrustToken", function () {
     await token.mintAudit(
       farmer.address,
       1001,
-      4,
+      40,
       "ipfs://cid-1",
       "land-1",
       2026
@@ -56,7 +56,7 @@ describe("TerraTrustToken", function () {
       token.mintAudit(
         farmer.address,
         1002,
-        7,
+        70,
         "ipfs://cid-2",
         "land-1",
         2026
@@ -70,20 +70,20 @@ describe("TerraTrustToken", function () {
     await token.mintAudit(
       farmer.address,
       1001,
-      10,
+      100,
       "ipfs://cid-1",
       "land-1",
       2026
     );
 
     await expect(
-      token.connect(farmer)["retireCredits(uint256,string)"](3, "Offset 2026 emissions")
+      token.connect(farmer)["retireCredits(uint256,string)"](30, "Offset 2026 emissions")
     )
       .to.emit(token, "CreditRetired")
-      .withArgs(farmer.address, 3, "Offset 2026 emissions", anyValue);
+      .withArgs(farmer.address, 30, "Offset 2026 emissions", anyValue);
 
-    expect(await token.balanceOf(farmer.address, 1)).to.equal(7n);
-    expect(await token.retiredCredits(farmer.address)).to.equal(3n);
+    expect(await token.balanceOf(farmer.address, 1)).to.equal(70n);
+    expect(await token.retiredCredits(farmer.address)).to.equal(30n);
   });
 
   it("rejects minting by a non-owner account", async function () {

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from web3 import Web3
 
 from app.database import supabase_client
 from app.dependencies import get_current_user
@@ -63,12 +64,12 @@ def _validate_full_name(full_name: str) -> str:
 def _validate_wallet_address(wallet_address: str) -> str:
     """Validate wallet format and raise the documented 400 response on failure."""
     candidate = wallet_address.strip()
-    if not WALLET_RE.fullmatch(candidate):
+    if not WALLET_RE.fullmatch(candidate) or not Web3.is_address(candidate):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid wallet address format",
         )
-    return candidate
+    return Web3.to_checksum_address(candidate)
 
 
 def _build_auth_me_response(current_user: Dict[str, Any]) -> AuthMeResponse:
@@ -80,6 +81,8 @@ def _build_auth_me_response(current_user: Dict[str, Any]) -> AuthMeResponse:
         full_name=current_user.get("full_name"),
         kyc_completed=bool(current_user.get("kyc_completed", False)),
         wallet_address=current_user.get("wallet_address"),
+        wallet_recovery_status=current_user.get("wallet_recovery_status"),
+        wallet_recovery_requested_at=current_user.get("wallet_recovery_requested_at"),
     )
 
 

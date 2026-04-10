@@ -35,7 +35,7 @@ WHAT CHANGED FROM PREVIOUS VERSION (v2.0)
 4. Tree height source changed.
    Old: AR measurement from farmer (phone anchor method).
    New: NASA GEDI rh98 canopy height from space. AR height used as fallback
-   only when no GEDI footprint exists at that location.
+  only for zones where GET /api/v1/audit/zones marks gedi_available=false.
 
 5. Sampling zones are satellite-guided.
    Old: Fixed arbitrary zones (N, S, Centre).
@@ -47,7 +47,8 @@ WHAT CHANGED FROM PREVIOUS VERSION (v2.0)
   metadata plus a dedicated gateway domain for certificate URLs.
 
 7. Smart contract fixed.
-   Fixed: creditAmount multiplication bug (removed * 10**18 from contract).
+  Fixed: creditAmount multiplication bug (removed * 10**18 scaling).
+       Contract now accepts integer deci-CTT units.
    Added: retireCredits() burn function for carbon market compliance.
    Added: Double-mint prevention mapping (auditMinted).
    Added: Hardhat config for Polygon Amoy testnet.
@@ -563,6 +564,7 @@ backend/
 │   │                                # POST /api/v1/auth/recover-wallet
 │   ├── land.py                      # POST /api/v1/land/verify-document
 │   │                                # GET  /api/v1/land/fetch-boundary
+│   │                                # POST /api/v1/land/fetch-boundary (manual map)
 │   │                                # POST /api/v1/land/register
 │   │                                # GET  /api/v1/land/list
 │   │                                # PATCH /api/v1/land/{land_id}
@@ -645,8 +647,9 @@ Purpose: Stores farmer identity, authentication linkage, and blockchain wallet.
 4.2A TABLE: wallet_recovery_requests
 ------------------------------------
 Purpose: Stores admin-assisted wallet rotation requests initiated from the
-mobile app. Historical audit evidence remains tied to the original wallet;
-approved requests affect only future credit issuance.
+mobile app. Historical audit evidence and already-issued on-chain token
+ownership remain tied to the original wallet; approved requests affect only
+future credit issuance and future certificates.
 
   CREATE TABLE wallet_recovery_requests (
       id                 UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -746,9 +749,10 @@ These are the ground truth data points used to train the XGBoost model.
       gps_accuracy_m   FLOAT,             -- GPS horizontal accuracy (m)
       species          VARCHAR(100) NOT NULL,  -- TF Lite detected species
       species_confidence FLOAT CHECK (species_confidence BETWEEN 0 AND 1),
+      species_source   VARCHAR(20) NOT NULL,   -- MODEL_AUTO / MODEL_CONFIRMED / MANUAL_SELECTED
       dbh_cm           FLOAT NOT NULL CHECK (dbh_cm > 0 AND dbh_cm < 500),
       height_m         FLOAT,             -- AR-measured height (fallback only)
-      gedi_height_m    FLOAT,             -- NASA GEDI rh98 height (primary)
+      gedi_height_m    FLOAT,             -- GEDI rh98 height resolved for this tree/zone
       height_source    VARCHAR(20),       -- 'GEDI' or 'AR_FALLBACK'
       wood_density     FLOAT NOT NULL,    -- Species-specific rho value (g/cm3)
       agb_kg           FLOAT,             -- Calculated by backend via Chave eq
@@ -794,7 +798,8 @@ This is the permanent ledger of all carbon credit generations.
       delta_biomass    FLOAT,             -- Growth = current - previous
       carbon_tonnes    FLOAT,             -- delta * 0.47
       co2_equivalent   FLOAT,             -- carbon * 3.667 (44/12 = CO2 conversion)
-      credits_issued   FLOAT,             -- = co2_equivalent
+      credits_issued   FLOAT,             -- Human-readable CTT amount
+                  -- On-chain raw units = credits_issued * 10
       trees_scanned_count INT,
       -- Blockchain
       ipfs_metadata_cid VARCHAR(255),     -- IPFS CID of evidence package
@@ -860,18 +865,24 @@ GET /api/v1/status
                "message": "Scheduled maintenance in progress" }
   Note:      When maintenance mode is active, any farmer-facing endpoint may
              also short-circuit with HTTP 503 and the same JSON payload.
+             While the maintenance screen is visible, the mobile app polls
+             GET /api/v1/status every 10 seconds until maintenance=false.
 
 --------------------------------------------------------------------------------
 5.2 AUTH MODULE (/api/v1/auth)
 --------------------------------------------------------------------------------
 
 POST /api/v1/auth/kyc
-  Purpose:   Saves farmer KYC data after first OTP login.
+  Purpose:   Saves farmer KYC identity data after first OTP login.
   Auth:      Required (Firebase ID token)
   Request:   {
                "full_name": "Ramesh Patil",
                "aadhaar_number": "XXXXXXXXXXXX"   // 12 digits, will be hashed
              }
+  Reason:    OTP verifies control of the phone number, but not the claimant's
+             real-world identity. Aadhaar is the v3.1 KYC identifier used to
+             anchor the farmer record, support owner-name matching against the
+             7/12 extract, and re-verify the same person during wallet recovery.
   Process:   1. Hash aadhaar_number with SHA-256. Store hash only.
              2. Store full_name in users table.
              3. Set kyc_completed = true.
@@ -918,7 +929,9 @@ GET /api/v1/auth/me
                "phone_number": "+91XXXXXXXXXX",
                "full_name": "Ramesh Patil",
                "kyc_completed": true,
-               "wallet_address": "0x..."
+               "wallet_address": "0x...",
+               "wallet_recovery_status": null,
+               "wallet_recovery_requested_at": null
              }
 
 --------------------------------------------------------------------------------
@@ -1031,6 +1044,19 @@ GET /api/v1/land/fetch-boundary
              }
   Response (fallback): { "status": "manual_required" }
 
+POST /api/v1/land/fetch-boundary
+  Purpose:   Layer 3 manual-map processing variant used after the farmer
+             uploads a downloaded government parcel map image.
+  Auth:      Required
+  Request:   multipart/form-data with map_image, survey_number, district,
+             taluka, village, state
+  Process:   Extract polygon edges from the uploaded map image with OpenCV,
+             validate the polygon, generate the same Sentinel-2 thumbnail, and
+             return the standard boundary payload with boundary_source='MANUAL'.
+  Response:  Same success payload as GET /api/v1/land/fetch-boundary,
+             with "boundary_source": "MANUAL".
+  Error 422: { "error": "Could not extract a valid parcel boundary from the uploaded map." }
+
 POST /api/v1/land/register
   Purpose:   Saves confirmed land boundary to database after farmer confirms.
   Auth:      Required
@@ -1078,8 +1104,14 @@ GET /api/v1/land/list
                    "id": "uuid",
                    "farm_name": "North Field",
                    "survey_number": "47",
+                   "district": "Pune",
+                   "taluka": "Haveli",
+                   "village": "Kharadi",
+                   "state": "Maharashtra",
                    "area_hectares": 0.49,
                    "is_verified": true,
+                   "boundary_source": "WMS_AUTO",
+                   "registered_at": "2026-05-18T12:00:00Z",
                    "last_audit_year": 2025,
                     "current_audit_id": "uuid",
                     "current_audit_status": "CALCULATING",
@@ -1141,7 +1173,8 @@ GET /api/v1/audit/zones
                 .filterBounds(region).select(['rh98']).mean()
          gedi_coverage = check if any GEDI footprints exist in each zone
     8. Save zones to sampling_zones table. Create audit record with
-       status='PROCESSING'.
+       status='PROCESSING'. Returned zones are scan-required areas only;
+       sparse canopy portions without a returned zone remain satellite-only.
     9. Return zones.
   Response:  {
                "audit_id": "uuid",
@@ -1160,6 +1193,11 @@ GET /api/v1/audit/zones
                "walking_path_metres": 145,
                "min_trees_required": 9
              }
+  Note:      Example above is a 3-zone parcel, so min_trees_required = 9.
+             gedi_available is determined per zone. When true, the backend
+             resolves height from the nearest valid GEDI sample inside that
+             zone and the app keeps height capture hidden. When false, the
+             app must collect AR height for every tree in that zone.
   Error 409: { "error": "An audit already exists for this land in the current audit year.",
                "existing_audit_id": "uuid",
                "status": "CALCULATING" }
@@ -1176,6 +1214,7 @@ POST /api/v1/audit/submit-samples
                    "zone_id": "uuid",
                    "species": "Teak",
                    "species_confidence": 0.91,
+                   "species_source": "MODEL_AUTO",
                    "dbh_cm": 22.4,
                    "height_m": null,        // null = use GEDI
                    "gps": { "lat": 18.5461, "lng": 73.9812 },
@@ -1189,8 +1228,13 @@ POST /api/v1/audit/submit-samples
                ]
              }
   Process:
-    1. Validate minimum tree count (must be >= 3 per zone, >= 9 total).
-       Reject any tree with species_confidence < 0.80.
+     1. Validate minimum tree count (must be >= 3 per generated zone;
+       min_trees_required = zone_count x 3).
+       Validate species according to species_source:
+         MODEL_AUTO      requires species_confidence >= 0.80
+         MODEL_CONFIRMED requires 0.60 <= species_confidence < 0.80
+         MANUAL_SELECTED requires species to be in the approved list
+                          even when model confidence is lower
        Reject any tree with gps_accuracy_m > 30.
        Reject any payload where evidence_photo_hash does not match the
        SHA-256 of the decoded, EXIF-stripped, final JPEG bytes provided.
@@ -1203,21 +1247,26 @@ POST /api/v1/audit/submit-samples
     3. Update carbon_audits status to 'CALCULATING'.
     4. Dispatch Celery background task:
          fusion_task.delay(audit_id, land_id)
-    5. Return immediately — do not wait for computation.
+     5. Return immediately — do not wait for computation.
+       If the same audit_id is submitted again while the audit is still in a
+       non-terminal state, return the current processing response and do not
+       create duplicate jobs.
   Response:  {
-               "status": "processing",
+               "status": "PROCESSING",
                "audit_id": "uuid",
                "estimated_seconds": 60,
                "message": "Satellite verification in progress"
              }
-  Error 400: { "error": "Minimum 9 trees required across all zones." }
+  Error 400: { "error": "Minimum [min_trees_required] trees required for this audit." }
 
 GET /api/v1/audit/result/{audit_id}
   Purpose:   Returns current status and result of audit computation.
              Mobile app polls this every 5 seconds after submission.
   Auth:      Required
-  Response (still processing):
-             { "status": "CALCULATING" }
+  Response (non-terminal):
+             { "status": "PROCESSING" } OR
+             { "status": "CALCULATING" } OR
+             { "status": "READY_TO_MINT" }
   Response (complete, no credits):
              {
                "status": "COMPLETE_NO_CREDITS",
@@ -1276,6 +1325,8 @@ GET /api/v1/credits/balance
     1. Look up wallet_address for the authenticated Firebase user.
     2. Call Polygon blockchain via web3.py:
          contract.functions.balanceOf(wallet_address, CARBON_CREDIT).call()
+      Contract returns integer deci-CTT units; backend divides by 10 before
+      returning balance_ctt to the mobile app.
     3. Fetch audit history from carbon_audits table for this user.
   Response:  {
                "balance_ctt": 47.3,
@@ -1359,11 +1410,12 @@ probability vector of 12 labels: the 11 approved species above plus
 NOT_APPROVED. The versioned mobile artifact in
 src/assets/tflite/species_model.tflite must ship with the matching class
 mapping for that model version. The backend never trains or runs this model at
-runtime; it validates only the submitted approved label and
-species_confidence threshold.
+runtime; it validates the submitted approved label together with
+species_source and species_confidence.
 The mobile model is trained offline from a curated labeled species dataset and
 exported as a versioned TFLite artifact. The backend does not train this model
-at runtime; it only validates the approved label set and confidence threshold.
+at runtime; it only validates the approved label set and the documented
+species_source contract.
 
 6.4 COMPLETE FUSION ENGINE CODE
 ---------------------------------
@@ -1692,7 +1744,8 @@ Run after fusion engine returns total_biomass_tonnes:
       # CO2 equivalent: carbon * (44/12) = carbon * 3.667
       co2_equivalent = carbon_tonnes * 3.667
 
-      # 1 CTT = 1 tonne CO2 equivalent
+      # credits_issued is the human-readable CTT amount.
+      # Minting converts it to integer deci-CTT units on-chain.
       credits_issued = co2_equivalent
 
       return {
@@ -1826,8 +1879,8 @@ UUID-to-uint256 conversion rule:
       function mintAudit(
           address farmer,        // Farmer's wallet address
           uint256 auditId,       // uuid.UUID(audit_id).int
-          uint256 creditAmount,  // Number of credits e.g. 12 for 12 tonnes
-                                 // NO multiplication — send actual number
+          uint256 creditAmount,  // Integer deci-CTT units e.g. 124 for 12.4 CTT
+                     // NO 10^18 scaling; backend sends display_ctt * 10
           string memory ipfsHash, // "ipfs://CID..." — points to evidence
           string memory landId,  // Internal land UUID as string
           uint256 auditYear      // e.g. 2026
@@ -1841,7 +1894,7 @@ UUID-to-uint256 conversion rule:
           auditMinted[auditKey] = true;
 
           // Mint fungible carbon credit tokens to farmer
-          // creditAmount is the actual number of CTT (e.g. 12)
+          // creditAmount is raw deci-CTT units (e.g. 124 = 12.4 CTT)
           _mint(farmer, CARBON_CREDIT, creditAmount, "");
 
           // Mint unique audit certificate NFT to farmer
@@ -2586,9 +2639,13 @@ APPENDIX A: ALIGNMENT CLARIFICATIONS (APRIL 2026)
   reject mismatches.
 
 4. Species acceptance contract
-  The backend accepts only the 11 approved species and requires
-  species_confidence >= 0.80 from the mobile client. Any unknown species or
-  lower-confidence classification must be rejected upstream.
+  The backend accepts only the 11 approved species.
+  MODEL_AUTO requires species_confidence >= 0.80.
+  MODEL_CONFIRMED requires 0.60 <= species_confidence < 0.80 and an explicit
+  farmer confirmation in the mobile flow.
+  MANUAL_SELECTED permits lower model confidence only when the farmer chose an
+  approved species label explicitly after a low-confidence or NOT_APPROVED
+  result. Any unknown species label must still be rejected upstream.
 
 5. GPS quality contract
   Zone arrival requires distance <= 10m and gps_accuracy_m <= 20.
@@ -2625,9 +2682,15 @@ APPENDIX A: ALIGNMENT CLARIFICATIONS (APRIL 2026)
 8. Wallet recovery requirement
   Production launch requires an admin-assisted wallet rotation capability.
   The backend must support identity-verified replacement of the farmer wallet
-  while preserving future credit issuance and certificate continuity.
+  while preserving future credit issuance and future certificate continuity.
+  Already-issued on-chain balances remain at the original wallet in v3.1 and
+  must be disclosed clearly in the product copy.
 
 9. Aadhaar handling
+  Aadhaar is collected only because OTP proves phone possession, while the
+  platform also needs a one-time identity anchor for owner-name matching and
+  wallet-recovery re-verification.
+  It is not used for biomass calculation, credit minting, or routine app use.
   Plain Aadhaar must be processed only in volatile memory, hashed
   immediately, excluded from logs, and never stored as an image or plaintext.
   Production launch requires legal review against India's Digital Personal
